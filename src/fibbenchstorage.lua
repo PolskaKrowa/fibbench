@@ -216,13 +216,27 @@ local function offloadEntry(idx)
   local entry = store[idx]
   if not entry or diskMeta[idx] then return false end
   if not ensureDiskPath() then return false end
+
+  -- Last-chance compression before touching disk: bypass COMPRESS_MIN
+  -- entirely — even a modest saving beats unnecessary I/O, and it keeps
+  -- the on-disk copy smaller for any future reads.
+  local data, compressed = entry.data, entry.compressed
+  if not compressed and useCompression then
+    local ok, result = pcall(dataCard.deflate, data)
+    if ok and result and #result < #data then
+      totalSavedBytes = totalSavedBytes + (#data - #result)
+      data       = result
+      compressed = true
+    end
+  end
+
   local path = DISK_PATH .. tostring(idx)
   local f = io.open(path, "wb")
   if not f then return false end
-  local ok = pcall(function() f:write(entry.data) end)
+  local writeOk = pcall(function() f:write(data) end)
   f:close()
-  if not ok then return false end
-  diskMeta[idx] = { compressed = entry.compressed }
+  if not writeOk then return false end
+  diskMeta[idx] = { compressed = compressed }
   store[idx]    = nil
   memCount      = memCount - 1
   diskCount     = diskCount + 1
@@ -230,24 +244,47 @@ local function offloadEntry(idx)
   return true
 end
 
--- Offload largest in-memory entries until RAM usage <= RAM_THRESH.
+-- Relieve RAM pressure.  Priority order:
+--   1. Compress every uncompressed in-RAM entry (free memory without I/O).
+--   2. Force a GC cycle to reclaim the now-dead oversized strings.
+--   3. Only if still above RAM_THRESH, offload to disk largest-first.
 -- Returns the number of entries moved to disk this call.
 local function checkRAMPressure()
-  local free  = computer.freeMemory()
   local total = computer.totalMemory()
-  if (1 - free / total) <= RAM_THRESH then return 0 end
+  if (1 - computer.freeMemory() / total) <= RAM_THRESH then return 0 end
 
-  -- Gather candidates sorted by stored-byte size, largest first.
-  -- Evicting big entries reclaims the most RAM per iteration.
+  -- Phase 1: compress any uncompressed entries still in RAM.
+  -- These are entries that were below COMPRESS_MIN at store time or
+  -- where compression produced no gain — try again unconditionally
+  -- because keeping them raw wastes RAM we might not need to lose.
+  if useCompression then
+    for _, entry in pairs(store) do
+      if not entry.compressed then
+        local ok, result = pcall(dataCard.deflate, entry.data)
+        if ok and result and #result < #entry.data then
+          totalSavedBytes = totalSavedBytes + (#entry.data - #result)
+          entry.data       = result
+          entry.compressed = true
+        end
+      end
+    end
+    -- Force a GC cycle so the oversized raw strings are reclaimed and
+    -- freeMemory() reflects the gain before we consider disk offload.
+    collectgarbage("collect")
+  end
+
+  -- Phase 2: offload to disk only if compression alone wasn't enough.
+  if (1 - computer.freeMemory() / total) <= RAM_THRESH then return 0 end
+
   local candidates = {}
   for idx, entry in pairs(store) do
     candidates[#candidates + 1] = { idx = idx, size = #entry.data }
   end
+  -- Largest first: maximise RAM reclaimed per disk write.
   table.sort(candidates, function(a, b) return a.size > b.size end)
 
   local moved = 0
   for _, item in ipairs(candidates) do
-    -- Re-sample freeMemory each loop; it rises as entries are cleared.
     if (1 - computer.freeMemory() / total) <= RAM_THRESH then break end
     if offloadEntry(item.idx) then moved = moved + 1 end
   end
