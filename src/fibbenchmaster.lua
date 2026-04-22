@@ -5,25 +5,6 @@
 --  arithmetic, and stores Fibonacci values to storage nodes as
 --  limb chunks so the rack acts like distributed swap.
 --
---  Optimisation notes (vs original):
---    1. bigadd: carry is always 0 or 1 when LIMB_BASE=10^7, so
---       math.floor() and % are replaced with a compare+subtract.
---       trimLimbs() removed from the return path (result is always
---       non-zero for Fibonacci n>0, and we handle the overflow limb
---       explicitly).
---    2. Network reload removed: prev/curr are already correct in
---       RAM; the old loadNumber(n-1)/loadNumber(n) block performed
---       unnecessary blocking round-trips every YIELD_EVERY steps.
---    3. drawFrame() called once before the loop; only drawStatus()
---       is called on each draw tick, eliminating repeated full-
---       screen redraws of unchanging borders.
---    4. decimalDigits(curr) cached once per YIELD block instead of
---       being recomputed three times (checkpoint, broadcast, draw).
---    5. fastPreview() converts only the leading limbs needed for
---       the display preview instead of calling toDecimal() on the
---       full number every draw tick.
---    6. YIELD_EVERY raised 50->200 so queue/stat overhead amortises
---       over more iterations.
 -- =============================================================
 
 local component = require("component")
@@ -155,11 +136,6 @@ local function decimalDigits(a)
   return (#a - 1) * LIMB_WIDTH + #hi
 end
 
--- OPTIMISED: carry is always 0 or 1 when LIMB_BASE = 10^7.
--- Two limbs are at most 9,999,999 each; adding carry 1 gives
--- 19,999,999 < 2*LIMB_BASE, so floor()/% are unnecessary.
--- The result never has spurious leading zeros for Fibonacci,
--- so trimLimbs() is not needed on the return value.
 local function bigadd(a, b)
   local result = {}
   local carry  = 0
@@ -715,9 +691,6 @@ lastCkptStatus = resumedFrom and string.format("resumed from fib(%d)", resumedFr
 lastCkptColor  = resumedFrom and C.ckpt_ok or C.dim
 lastCkptTime   = 0
 
--- OPTIMISED: drawFrame draws the static chrome only.
--- It is called once before the loop (and never again from inside
--- the loop) so the unchanging borders are not redrawn every tick.
 local function drawFrame()
   cls()
 
@@ -770,8 +743,6 @@ local function statRow(y, lLbl, lVal, lCol, rLbl, rVal, rCol)
   put(MID + 12, y, pad(tostring(rVal), W - MID - 13), rCol or C.number)
 end
 
--- OPTIMISED: accepts pre-computed digits and previewStr so this
--- function never calls decimalDigits() or toDecimal() itself.
 local function drawStatus(nVal, digits, elapsed, rate, previewStr)
   local lFree  = computer.freeMemory()
   local lTotal = computer.totalMemory()
@@ -926,9 +897,6 @@ while running do
   if n % YIELD_EVERY == 0 then
     local now = computer.uptime()
 
-    -- OPTIMISED: compute decimalDigits once and reuse everywhere.
-    -- Previously it was computed separately for checkpoint, stat
-    -- broadcast, and drawStatus -- three times per YIELD block.
     local currDigits  = decimalDigits(curr)
     local currPreview = fastPreview(curr, W - 12)
 
@@ -940,12 +908,6 @@ while running do
     end
 
     flushQueue()
-
-    -- REMOVED (was lines 644-651 in original):
-    -- The original code reloaded prev/curr from storage nodes here,
-    -- doing blocking network round-trips (up to 2 s per chunk) on
-    -- every YIELD_EVERY boundary even though prev and curr are
-    -- already correct in local memory.  Removed entirely.
 
     if now - lastCkptTime >= CHECKPOINT_INTERVAL then
       local ok, err = saveCheckpoint(n, prev, curr)
@@ -974,10 +936,6 @@ while running do
 
     if now - lastDraw >= DRAW_INTERVAL then
       lastDraw = now
-      -- OPTIMISED: drawFrame() is NOT called here any more.
-      -- It was repainting the full static chrome every 0.25 s.
-      -- We pass the already-computed preview string so drawStatus
-      -- never calls toDecimal() or decimalDigits() itself.
       drawStatus(n, currDigits, now - startTime, rate, currPreview)
     end
 
