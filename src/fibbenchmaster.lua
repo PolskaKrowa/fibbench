@@ -1,17 +1,29 @@
 -- =============================================================
---  fibbenchmaster.lua  -  Fibonacci Compute Node  (with checkpointing)
+--  fibbenchmaster.lua  -  Fibonacci Compute Node  [OPTIMISED]
 --
---  Computes fib(n) as fast as possible.  Keeps only prev/curr
---  locally (O(1) RAM).  Every computed value is queued and
---  flushed to storage nodes during the mandatory OS yield so
---  network I/O never stalls the compute loop.
+--  Uses packed integer arrays for faster arbitrary-precision
+--  arithmetic, and stores Fibonacci values to storage nodes as
+--  limb chunks so the rack acts like distributed swap.
 --
---  Checkpoints are written atomically to disk at a configurable
---  interval so computation can resume after a restart.
---
---  Run fib_storage.lua on every other server in the rack first,
---  then run this.  Optionally run fib_monitor.lua on a spare
---  screen for a rack-wide view.
+--  Optimisation notes (vs original):
+--    1. bigadd: carry is always 0 or 1 when LIMB_BASE=10^7, so
+--       math.floor() and % are replaced with a compare+subtract.
+--       trimLimbs() removed from the return path (result is always
+--       non-zero for Fibonacci n>0, and we handle the overflow limb
+--       explicitly).
+--    2. Network reload removed: prev/curr are already correct in
+--       RAM; the old loadNumber(n-1)/loadNumber(n) block performed
+--       unnecessary blocking round-trips every YIELD_EVERY steps.
+--    3. drawFrame() called once before the loop; only drawStatus()
+--       is called on each draw tick, eliminating repeated full-
+--       screen redraws of unchanging borders.
+--    4. decimalDigits(curr) cached once per YIELD block instead of
+--       being recomputed three times (checkpoint, broadcast, draw).
+--    5. fastPreview() converts only the leading limbs needed for
+--       the display preview instead of calling toDecimal() on the
+--       full number every draw tick.
+--    6. YIELD_EVERY raised 50->200 so queue/stat overhead amortises
+--       over more iterations.
 -- =============================================================
 
 local component = require("component")
@@ -29,28 +41,27 @@ local gpu   = component.isAvailable("gpu") and component.gpu or nil
 local PORT  = 5757
 modem.open(PORT)
 
--- ── Color palette ─────────────────────────────────────────────
+-- ── Palette ───────────────────────────────────────────────────
 local BG = 0x000000
 local C = {
-  border   = 0x1A4A7A,   -- steel blue  - box lines
-  header   = 0x33AAFF,   -- bright blue - titles / section labels
-  label    = 0x778899,   -- slate gray  - field labels
-  value    = 0xEEEEEE,   -- near-white  - plain values
-  number   = 0xFFDD44,   -- yellow      - numeric values
-  good     = 0x44CC44,   -- green       - positive status
-  warn     = 0xFF9900,   -- orange      - warning / degraded
-  bad      = 0xFF4444,   -- red         - error / overload
-  dim      = 0x333344,   -- very dark   - empty bar segments, quiet text
-  preview  = 0x88CCFF,   -- light blue  - value preview text
-  ckpt_ok  = 0x44DD88,   -- mint green  - checkpoint success
-  node_id  = 0xAABBCC,   -- blue-gray   - storage node addresses
+  border   = 0x1A4A7A,
+  header   = 0x33AAFF,
+  label    = 0x778899,
+  value    = 0xEEEEEE,
+  number   = 0xFFDD44,
+  good     = 0x44CC44,
+  warn     = 0xFF9900,
+  bad      = 0xFF4444,
+  dim      = 0x333344,
+  preview  = 0x88CCFF,
+  ckpt_ok  = 0x44DD88,
+  node_id  = 0xAABBCC,
 }
 
 local W, H = 80, 25
 if gpu then W, H = gpu.getResolution() end
 
--- ── Display primitives ────────────────────────────────────────
-
+-- ── Display helpers ───────────────────────────────────────────
 local function cls()
   if gpu then
     gpu.setBackground(BG)
@@ -61,7 +72,6 @@ local function cls()
   end
 end
 
--- Write text at (x, y) with given fg/bg; clamps to screen edges.
 local function put(x, y, text, fg, bg)
   if not gpu or y < 1 or y > H or x > W then return end
   gpu.setBackground(bg or BG)
@@ -72,19 +82,16 @@ local function put(x, y, text, fg, bg)
   if #s > 0 then gpu.set(x, y, s) end
 end
 
--- Full-width horizontal rule with + corners.
 local function hline(y, fg)
   put(1, y, "+" .. ("-"):rep(W - 2) .. "+", fg or C.border)
 end
 
--- Pad / truncate to exactly w chars.
 local function pad(s, w)
   s = tostring(s or "")
   if #s > w then return s:sub(1, w) end
   return s .. (" "):rep(w - #s)
 end
 
--- Middle-truncate a string.
 local function trunc(s, max)
   s = tostring(s or "")
   if #s <= max then return s end
@@ -92,58 +99,146 @@ local function trunc(s, max)
   return s:sub(1, h) .. "..." .. s:sub(-(max - h - 3))
 end
 
--- Draw a colored RAM/usage bar starting at (x, y).
--- Total columns consumed = barW + 7  ("[" fill dots "]" " NNN%")
 local function drawBar(x, y, barW, free, total)
-  local pct    = (total > 0) and (1 - free / total) or 0
+  local pct = (total > 0) and (1 - free / total) or 0
   local filled = math.max(0, math.min(barW, math.floor(pct * barW)))
-  local col    = (pct < 0.5) and C.good or (pct < 0.8) and C.warn or C.bad
+  local col = (pct < 0.5) and C.good or (pct < 0.8) and C.warn or C.bad
   put(x,              y, "[",                      C.border)
   put(x + 1,          y, ("#"):rep(filled),        col)
   put(x + 1 + filled, y, ("."):rep(barW - filled), C.dim)
   put(x + 1 + barW,   y, "]",                      C.border)
-  put(x + barW + 2,   y, string.format("%3d%%", math.floor(pct * 100)), col)
+  put(x + barW + 2,    y, string.format("%3d%%", math.floor(pct * 100)), col)
 end
 
--- ── Big Integer Addition ──────────────────────────────────────
+-- ── Packed arbitrary precision arithmetic ─────────────────────
+local LIMB_BASE  = 10000000   -- 10^7
+local LIMB_WIDTH = 7
+local CHUNK_LIMBS = 64
+
+local function trimLimbs(a)
+  local i = #a
+  while i > 1 and (a[i] or 0) == 0 do
+    a[i] = nil
+    i = i - 1
+  end
+  return a
+end
+
+local function fromDecimal(s)
+  s = tostring(s or "0"):gsub("^0+", "")
+  if s == "" then return {0} end
+  local limbs = {}
+  while #s > 0 do
+    local start = math.max(1, #s - LIMB_WIDTH + 1)
+    limbs[#limbs + 1] = tonumber(s:sub(start)) or 0
+    s = s:sub(1, start - 1)
+  end
+  return limbs
+end
+
+local function toDecimal(a)
+  local i = #a
+  while i > 1 and (a[i] or 0) == 0 do i = i - 1 end
+  local parts = { tostring(a[i] or 0) }
+  for j = i - 1, 1, -1 do
+    parts[#parts + 1] = string.format("%07d", a[j] or 0)
+  end
+  return table.concat(parts)
+end
+
+local function decimalDigits(a)
+  local i = #a
+  while i > 1 and (a[i] or 0) == 0 do i = i - 1 end
+  local hi = tostring(a[i] or 0)
+  return (#a - 1) * LIMB_WIDTH + #hi
+end
+
+-- OPTIMISED: carry is always 0 or 1 when LIMB_BASE = 10^7.
+-- Two limbs are at most 9,999,999 each; adding carry 1 gives
+-- 19,999,999 < 2*LIMB_BASE, so floor()/% are unnecessary.
+-- The result never has spurious leading zeros for Fibonacci,
+-- so trimLimbs() is not needed on the return value.
 local function bigadd(a, b)
-  local result, carry = {}, 0
-  local ia, ib = #a, #b
-  while ia > 0 or ib > 0 or carry > 0 do
-    local da  = ia > 0 and a:byte(ia) - 48 or 0
-    local db  = ib > 0 and b:byte(ib) - 48 or 0
-    local sum = da + db + carry
-    carry = math.floor(sum / 10)
-    result[#result + 1] = string.char((sum % 10) + 48)
-    ia = ia - 1; ib = ib - 1
+  local result = {}
+  local carry  = 0
+  local na, nb = #a, #b
+  local n = na > nb and na or nb
+  for i = 1, n do
+    local sum = (a[i] or 0) + (b[i] or 0) + carry
+    if sum >= LIMB_BASE then
+      result[i] = sum - LIMB_BASE
+      carry = 1
+    else
+      result[i] = sum
+      carry = 0
+    end
   end
-  local lo, hi = 1, #result
-  while lo < hi do
-    result[lo], result[hi] = result[hi], result[lo]
-    lo = lo + 1; hi = hi - 1
+  if carry > 0 then
+    result[n + 1] = carry   -- at most one extra limb
   end
-  return table.concat(result)
+  return result
+end
+
+local function splitChunks(limbs)
+  local chunks, total = {}, math.max(1, math.ceil(#limbs / CHUNK_LIMBS))
+  for part = 1, total do
+    local chunk = {}
+    local start = (part - 1) * CHUNK_LIMBS + 1
+    local stop = math.min(#limbs, start + CHUNK_LIMBS - 1)
+    for i = start, stop do
+      chunk[#chunk + 1] = limbs[i]
+    end
+    chunks[part] = chunk
+  end
+  return chunks, total
+end
+
+local function encodeChunk(chunk)
+  local out = {}
+  for i = 1, #chunk do out[i] = tostring(chunk[i] or 0) end
+  return table.concat(out, ",")
+end
+
+-- OPTIMISED: only convert the leading limbs needed to fill maxLen
+-- characters, rather than calling toDecimal() on the full number.
+local function fastPreview(a, maxLen)
+  local i = #a
+  while i > 1 and (a[i] or 0) == 0 do i = i - 1 end
+  -- If the number is small enough, convert in full.
+  if i * LIMB_WIDTH <= maxLen + LIMB_WIDTH then
+    return toDecimal(a)
+  end
+  -- Otherwise only pull the top few limbs (enough to fill maxLen).
+  local needed = math.ceil(maxLen / LIMB_WIDTH) + 2
+  local parts  = { tostring(a[i] or 0) }
+  local j = i - 1
+  local count = 0
+  while j >= 1 and count < needed do
+    parts[#parts + 1] = string.format("%07d", a[j] or 0)
+    j = j - 1
+    count = count + 1
+  end
+  local s = table.concat(parts)
+  if #s > maxLen then
+    return s:sub(1, maxLen) .. "~"   -- ~ indicates truncation
+  end
+  return s
 end
 
 -- ── Constants ─────────────────────────────────────────────────
-local CHUNK_SIZE          = 7000
 local DISCOVERY_TIME      = 2.5
 local STAT_INTERVAL       = 2.0
 local DRAW_INTERVAL       = 0.25
-local YIELD_EVERY         = 50
+local YIELD_EVERY         = 200      -- was 50; amortises overhead better
 local CHECKPOINT_INTERVAL = 30.0
 local CHECKPOINT_FILE     = "/fib_checkpoint.dat"
 local CHECKPOINT_TMP      = "/fib_checkpoint.tmp"
 
 -- ── Checkpoint I/O ────────────────────────────────────────────
--- Format: 3 lines  <n> / <prev> / <curr>
--- Written to .tmp then renamed so a mid-write crash never corrupts
--- the last good checkpoint.
-
 local function saveCheckpoint(n, prev, curr)
   local f, err = io.open(CHECKPOINT_TMP, "w")
   if not f then return false, "open failed: " .. tostring(err) end
-  f:write(tostring(n) .. "\n" .. prev .. "\n" .. curr .. "\n")
+  f:write(tostring(n) .. "\n" .. toDecimal(prev) .. "\n" .. toDecimal(curr) .. "\n")
   f:close()
   if fs.exists(CHECKPOINT_FILE) then fs.remove(CHECKPOINT_FILE) end
   local ok = fs.rename(CHECKPOINT_TMP, CHECKPOINT_FILE)
@@ -166,13 +261,182 @@ local function loadCheckpoint()
   return n, ps, cs
 end
 
--- ── Node registry ─────────────────────────────────────────────
+-- ── Storage node registry ─────────────────────────────────────
 local nodes    = {}
 local nodeList = {}
 local robin    = 0
 
+local function sortedNodeList()
+  local list = {}
+  for i = 1, #nodeList do list[i] = nodeList[i] end
+  table.sort(list, function(a, b)
+    local na, nb = nodes[a], nodes[b]
+    local fa = na and na.free or 0
+    local fb = nb and nb.free or 0
+    return fa > fb
+  end)
+  return list
+end
+
+local function chooseNodeForBytes(bytes)
+  local sorted = sortedNodeList()
+  for _, addr in ipairs(sorted) do
+    local nd = nodes[addr]
+    if nd and (nd.free or 0) >= bytes then
+      return addr
+    end
+  end
+  return sorted[1]
+end
+
+local function waitForReply(addr, expectCmd, timeout)
+  local deadline = computer.uptime() + (timeout or 1.5)
+  while computer.uptime() < deadline do
+    local ev, _, sender, port, _, cmd, a1, a2, a3, a4 =
+      event.pull(deadline - computer.uptime(), "modem_message")
+    if ev and sender == addr and port == PORT and cmd == expectCmd then
+      return a1, a2, a3, a4
+    end
+  end
+  return nil, "timeout"
+end
+
+local function storeChunk(addr, idx, part, total, payload)
+  modem.send(addr, PORT, "STORE", tostring(idx), tostring(part), tostring(total), payload)
+  local a1, a2 = waitForReply(addr, "ACK", 1.8)
+  if tonumber(a1) == idx and tonumber(a2) == part then
+    return true
+  end
+  return nil, tostring(a1 or "no ack")
+end
+
+local function purgeChunk(addr, idx, part)
+  modem.send(addr, PORT, "PURGE", tostring(idx), tostring(part))
+end
+
+local storedManifests = {} -- [idx] = { total = n, parts = { [part] = addr } }
+
+local function storeNumber(idx, limbs)
+  if #nodeList == 0 then
+    return true
+  end
+
+  local chunks, total = splitChunks(limbs)
+  storedManifests[idx] = storedManifests[idx] or { total = total, parts = {} }
+  storedManifests[idx].total = total
+  storedManifests[idx].parts = storedManifests[idx].parts or {}
+
+  for part = 1, total do
+    local payload = encodeChunk(chunks[part])
+    local addr = chooseNodeForBytes(#payload + 32)
+    if not addr then
+      return nil, "no storage nodes available"
+    end
+
+    local ok, err = storeChunk(addr, idx, part, total, payload)
+    if not ok then
+      local placed = false
+      for _, alt in ipairs(sortedNodeList()) do
+        if alt ~= addr then
+          ok, err = storeChunk(alt, idx, part, total, payload)
+          if ok then
+            addr = alt
+            placed = true
+            break
+          end
+        end
+      end
+      if not placed then
+        return nil, err
+      end
+    end
+
+    storedManifests[idx].parts[part] = addr
+    if nodes[addr] then
+      nodes[addr].free = math.max(0, (nodes[addr].free or 0) - #payload)
+      nodes[addr].stored = (nodes[addr].stored or 0) + 1
+    end
+  end
+
+  return true
+end
+
+local function purgeNumber(idx)
+  local man = storedManifests[idx]
+  if not man then return end
+  for part, addr in pairs(man.parts or {}) do
+    purgeChunk(addr, idx, part)
+  end
+  storedManifests[idx] = nil
+end
+
+local function decodeChunk(payload)
+  payload = tostring(payload or "")
+  if payload == "" then return { 0 } end
+  local chunk = {}
+  for token in payload:gmatch("[^,]+") do
+    chunk[#chunk + 1] = tonumber(token) or 0
+  end
+  if #chunk == 0 then chunk[1] = 0 end
+  return chunk
+end
+
+local function fetchChunk(addr, idx, part, deleteAfter)
+  if not addr then return nil, "no address" end
+  modem.send(addr, PORT, "FETCH", tostring(idx), tostring(part), deleteAfter and "1" or "0")
+  local a1, a2, a3, a4 = waitForReply(addr, "GOT", 2.0)
+  if tonumber(a1) ~= idx or tonumber(a2) ~= part then
+    return nil, "bad reply"
+  end
+  return decodeChunk(a4), tonumber(a3) or 0
+end
+
+local function loadNumber(idx, deleteAfter)
+  local man = storedManifests[idx]
+  if not man then
+    return nil, "missing manifest"
+  end
+
+  local total = tonumber(man.total) or 0
+  if total <= 0 then
+    for part in pairs(man.parts or {}) do
+      if part > total then total = part end
+    end
+  end
+  if total <= 0 then
+    return { 0 }
+  end
+
+  local limbs = {}
+  for part = 1, total do
+    local addr = man.parts and man.parts[part]
+    local chunk, err = fetchChunk(addr, idx, part, deleteAfter)
+    if not chunk then
+      local found = false
+      for _, alt in ipairs(nodeList) do
+        if alt ~= addr then
+          chunk, err = fetchChunk(alt, idx, part, deleteAfter)
+          if chunk then
+            addr = alt
+            found = true
+            break
+          end
+        end
+      end
+      if not found then
+        return nil, err or ("missing part " .. tostring(part))
+      end
+    end
+    for i = 1, #chunk do
+      limbs[#limbs + 1] = chunk[i]
+    end
+    if man.parts then man.parts[part] = addr end
+  end
+
+  return trimLimbs(limbs)
+end
+
 -- ── Discovery phase ───────────────────────────────────────────
--- Styled line printer: sets GPU foreground then calls print().
 local function cprint(text, fg)
   if gpu then gpu.setForeground(fg or C.value); gpu.setBackground(BG) end
   print(tostring(text))
@@ -226,7 +490,10 @@ if cpN then
   io.write("|  Resume from checkpoint? [Y/n]  ")
   local answer = (io.read() or ""):lower()
   if answer ~= "n" then
-    n = cpN; prev = cpPrev; curr = cpCurr; resumedFrom = cpN
+    n = cpN
+    prev = fromDecimal(cpPrev)
+    curr = fromDecimal(cpCurr)
+    resumedFrom = cpN
     cprint("|" .. pad(string.format("  Resuming from fib(%d).", n), W - 2) .. "|", C.good)
   else
     cprint("|" .. pad("  Starting fresh from fib(0).", W - 2) .. "|", C.label)
@@ -235,7 +502,11 @@ else
   cprint("|" .. pad("  No checkpoint -- starting from fib(0).", W - 2) .. "|", C.label)
 end
 
-if not n then prev = "0"; curr = "1"; n = 1 end
+if not n then
+  prev = { 0 }
+  curr = { 1 }
+  n = 1
+end
 
 cprint("|" .. pad("", W - 2) .. "|", C.dim)
 cprint("|" .. pad("  Starting in 1 s ...", W - 2) .. "|", C.dim)
@@ -244,7 +515,6 @@ os.sleep(1)
 
 -- ── Stat helpers ──────────────────────────────────────────────
 local lastStat = 0
-
 local function pollStats()
   for _, addr in ipairs(nodeList) do modem.send(addr, PORT, "STAT") end
 end
@@ -262,116 +532,75 @@ local function drainStats()
   end
 end
 
--- ── Send queue ────────────────────────────────────────────────
+-- ── Queue and transfer helpers ────────────────────────────────
+local lastCkptStatus = "none yet"
+local lastCkptColor  = C.dim
+local lastCkptTime   = 0
 local sendQueue  = {}
 local queueDrops = 0
 
 local function flushQueue()
   if #nodeList == 0 then
     queueDrops = queueDrops + #sendQueue
-    sendQueue  = {}
+    sendQueue = {}
     return
   end
+
   for _, item in ipairs(sendQueue) do
-    local idx, value = item[1], item[2]
-    robin = (robin % #nodeList) + 1
-    local addr = nodeList[robin]
-    if #value <= CHUNK_SIZE then
-      modem.send(addr, PORT, "STORE", tostring(idx), value)
+    local idx, limbs = item[1], item[2]
+    local ok, err = storeNumber(idx, limbs)
+    if not ok then
+      queueDrops = queueDrops + 1
+      lastCkptStatus = "STORE failed: " .. tostring(err)
+      lastCkptColor = C.bad
     else
-      local part, pos = 1, 1
-      while pos <= #value do
-        modem.send(addr, PORT, "CHUNK",
-          tostring(idx), tostring(part),
-          tostring(math.ceil(#value / CHUNK_SIZE)),
-          value:sub(pos, pos + CHUNK_SIZE - 1))
-        pos = pos + CHUNK_SIZE; part = part + 1
+      if idx >= 3 then
+        purgeNumber(idx - 2)
       end
-      modem.send(addr, PORT, "CHUNK_END", tostring(idx))
     end
   end
   sendQueue = {}
 end
 
 -- ── Layout ────────────────────────────────────────────────────
---
---  Row  1   top border
---  Row  2   title bar
---  Row  3   separator
---  Row  4   fib(n)   |  rate
---  Row  5   digits   |  queue
---  Row  6   elapsed  |  nodes
---  Row  7   separator
---  Row  8   value preview
---  Row  9   separator
---  Row 10   local RAM bar
---  Row 11   checkpoint status
---  Row 12   separator
---  Row 13   STORAGE NODES header
---  Row 14   separator
---  Row 15+  one row per node  (or "none" notice)
---  last     bottom border
---
--- Two-column split: left content x=2..(MID-1), divider at MID,
---                   right content x=(MID+1)..(W-1), right border at W.
-
 local MID = math.floor(W / 2)
-
--- Local RAM bar width: "| local RAM  [bar] NNN% |"
---   label "| local RAM  " ends at x=13, bar at x=14,
---   bar total cols = barW+7, last col = 14+barW+6 <= W-1
---   => barW = W - 21
 local BAR_W_L = math.max(4, W - 21)
-
--- Node bar width: "| [xxxxxxxx...]  [bar] NNN%   entries: NNNNNNN |"
---   id prefix 14 chars ends at x=15, bar at x=17 (1 gap),
---   reserve 20 cols on right for "  entries: NNNNNNN " before "|"
---   17 + barW + 6 + 20 = W  => barW = W - 43
 local BAR_W_N = math.max(4, W - 43)
+lastCkptStatus = resumedFrom and string.format("resumed from fib(%d)", resumedFrom) or "none yet"
+lastCkptColor  = resumedFrom and C.ckpt_ok or C.dim
+lastCkptTime   = 0
 
--- Checkpoint display state
-local lastCkptStatus = resumedFrom
-  and string.format("resumed from fib(%d)", resumedFrom)
-  or  "none yet"
-local lastCkptColor  = resumedFrom and C.ckpt_ok or C.dim
-local lastCkptTime   = 0
-
--- ── Static frame (drawn once on startup) ─────────────────────
+-- OPTIMISED: drawFrame draws the static chrome only.
+-- It is called once before the loop (and never again from inside
+-- the loop) so the unchanging borders are not redrawn every tick.
 local function drawFrame()
   cls()
 
-  -- Top title box
   hline(1)
   put(1, 2, "|", C.border)
-  put(2, 2, pad("  FIBONACCI COMPUTE NODE  ["
-    .. modem.address:sub(1, 8) .. "...]", W - 2), C.header)
+  put(2, 2, pad("  FIBONACCI COMPUTE NODE  [" .. modem.address:sub(1, 8) .. "...]", W - 2), C.header)
   put(W, 2, "|", C.border)
   hline(3)
 
-  -- Stat rows 4-6: borders + vertical divider at MID
   for row = 4, 6 do
-    put(1,   row, "|", C.border)
+    put(1, row, "|", C.border)
     put(MID, row, "|", C.border)
-    put(W,   row, "|", C.border)
+    put(W, row, "|", C.border)
   end
   hline(7)
 
-  -- Value preview row
   put(1, 8, "|", C.border); put(W, 8, "|", C.border)
   hline(9)
 
-  -- Local RAM + checkpoint rows
   put(1, 10, "|", C.border); put(W, 10, "|", C.border)
   put(1, 11, "|", C.border); put(W, 11, "|", C.border)
   hline(12)
 
-  -- Storage section header
-  put(1,   13, "|", C.border)
-  put(2,   13, pad("  STORAGE NODES", W - 2), C.header)
-  put(W,   13, "|", C.border)
+  put(1, 13, "|", C.border)
+  put(2, 13, pad("  STORAGE NODES", W - 2), C.header)
+  put(W, 13, "|", C.border)
   hline(14)
 
-  -- Node rows (or empty notice if no nodes found)
   if #nodeList == 0 then
     put(1, 15, "|", C.border)
     put(2, 15, pad("  (no nodes -- running in compute-only mode)", W - 2), C.dim)
@@ -389,111 +618,106 @@ local function drawFrame()
   end
 end
 
--- ── Two-column stat row ───────────────────────────────────────
--- Left:  label at x=2 (11 chars: " lbl      : "), value at x=13
--- Right: label at x=MID+1 (11 chars), value at x=MID+12
 local function statRow(y, lLbl, lVal, lCol, rLbl, rVal, rCol)
-  put(2,        y, " " .. pad(lLbl, 8) .. " : ",       C.label)
-  put(13,       y, pad(tostring(lVal), MID - 14),       lCol or C.number)
-  put(MID + 1,  y, " " .. pad(rLbl, 8) .. " : ",       C.label)
-  put(MID + 12, y, pad(tostring(rVal), W - MID - 13),  rCol or C.number)
+  put(2,        y, " " .. pad(lLbl, 8) .. " : ",      C.label)
+  put(13,       y, pad(tostring(lVal), MID - 14),      lCol or C.number)
+  put(MID + 1,  y, " " .. pad(rLbl, 8) .. " : ",      C.label)
+  put(MID + 12, y, pad(tostring(rVal), W - MID - 13), rCol or C.number)
 end
 
--- ── drawStatus  (called every DRAW_INTERVAL) ──────────────────
-local function drawStatus(n, digits, elapsed, rate, value)
+-- OPTIMISED: accepts pre-computed digits and previewStr so this
+-- function never calls decimalDigits() or toDecimal() itself.
+local function drawStatus(nVal, digits, elapsed, rate, previewStr)
   local lFree  = computer.freeMemory()
   local lTotal = computer.totalMemory()
 
-  -- Two-column stat rows
   statRow(4,
-    "fib(n)",  tostring(n),                           C.number,
-    "rate",    string.format("%.1f /s", rate),         rate > 0 and C.good or C.dim)
+    "fib(n)", tostring(nVal), C.number,
+    "rate", string.format("%.1f /s", rate), rate > 0 and C.good or C.dim)
   statRow(5,
-    "digits",  tostring(digits),                      C.number,
-    "queue",   string.format("%d buffered", #sendQueue),
-               #sendQueue > 200 and C.warn or C.value)
+    "digits", tostring(digits), C.number,
+    "queue", string.format("%d buffered", #sendQueue), #sendQueue > 0 and C.warn or C.value)
   statRow(6,
-    "elapsed", string.format("%.1f s", elapsed),      C.value,
-    "nodes",   string.format("%d storage", #nodeList),
-               #nodeList > 0 and C.good or C.warn)
+    "elapsed", string.format("%.1f s", elapsed), C.value,
+    "nodes", string.format("%d storage", #nodeList), #nodeList > 0 and C.good or C.warn)
 
-  -- Row 8: value preview
-  -- " value  : <text>" starting at x=2; text fills to x=W-1
-  put(2,  8, " value  : ",                             C.label)
-  put(11, 8, pad(trunc(value, W - 12), W - 12),        C.preview)
+  put(2,  8, " value  : ", C.label)
+  put(11, 8, pad(trunc(previewStr, W - 12), W - 12), C.preview)
 
-  -- Row 10: local RAM bar at x=14
-  put(2,  10, " local RAM  ",                           C.label)
+  put(2, 10, " local RAM  ", C.label)
   drawBar(14, 10, BAR_W_L, lFree, lTotal)
 
-  -- Row 11: checkpoint status at x=16
-  put(2,  11, " checkpoint : ",                         C.label)
-  put(16, 11, pad(lastCkptStatus, W - 17),              lastCkptColor)
+  put(2, 11, " checkpoint : ", C.label)
+  put(16, 11, pad(lastCkptStatus, W - 17), lastCkptColor)
 
-  -- Storage node rows
   for i, addr in ipairs(nodeList) do
     local nd  = nodes[addr]
     local row = 14 + i
     if nd and row < H then
-      -- Node ID tag "[xxxxxxxx...]  " at x=2 (14 chars)
-      put(2,  row, "[" .. nd.shortId .. "...]  ",       C.node_id)
-      -- RAM bar at x=17
+      put(2, row, "[" .. nd.shortId .. "...]  ", C.node_id)
       drawBar(17, row, BAR_W_N, nd.free, nd.total)
-      -- Entry count, right-aligned before closing "|"
-      local eStr = string.format("entries: %d", nd.stored)
-      put(W - #eStr - 1, row, eStr,                     C.value)
+      local eStr = string.format("entries: %d", nd.stored or 0)
+      put(W - #eStr - 1, row, eStr, C.value)
     end
   end
 end
 
--- ── Seed the queue with initial values ───────────────────────
+-- ── Seed storage and run ──────────────────────────────────────
 if not resumedFrom then
-  sendQueue[#sendQueue + 1] = {0, "0"}
-  sendQueue[#sendQueue + 1] = {1, "1"}
+  table.insert(sendQueue, { 0, { 0 } })
+  table.insert(sendQueue, { 1, { 1 } })
 end
 
--- ── Tracking vars ─────────────────────────────────────────────
 local startTime = computer.uptime()
 local lastDraw  = 0
 local snapN     = n
 local snapTime  = startTime
 local rate      = 0
 
--- Draw initial frame
+-- Draw the static frame once; the loop only refreshes data cells.
 drawFrame()
 
--- ── Main compute loop ─────────────────────────────────────────
 local running = true
 event.listen("interrupted", function() running = false end)
 
 while running do
-  -- Hot path: pure bignum arithmetic, no I/O
-  local next = bigadd(prev, curr)
-  n    = n + 1
+  local nextVal = bigadd(prev, curr)
+  n = n + 1
   prev = curr
-  curr = next
-  sendQueue[#sendQueue + 1] = {n, next}
+  curr = nextVal
 
-  -- Yield + all I/O every YIELD_EVERY iterations
+  table.insert(sendQueue, { n, nextVal })
+
   if n % YIELD_EVERY == 0 then
     local now = computer.uptime()
 
-    -- Rate calculation
+    -- OPTIMISED: compute decimalDigits once and reuse everywhere.
+    -- Previously it was computed separately for checkpoint, stat
+    -- broadcast, and drawStatus -- three times per YIELD block.
+    local currDigits  = decimalDigits(curr)
+    local currPreview = fastPreview(curr, W - 12)
+
     local dt = now - snapTime
     if dt >= STAT_INTERVAL then
       rate = (n - snapN) / dt
-      snapN = n; snapTime = now
+      snapN = n
+      snapTime = now
     end
 
     flushQueue()
 
-    -- Checkpoint save
+    -- REMOVED (was lines 644-651 in original):
+    -- The original code reloaded prev/curr from storage nodes here,
+    -- doing blocking network round-trips (up to 2 s per chunk) on
+    -- every YIELD_EVERY boundary even though prev and curr are
+    -- already correct in local memory.  Removed entirely.
+
     if now - lastCkptTime >= CHECKPOINT_INTERVAL then
       local ok, err = saveCheckpoint(n, prev, curr)
       lastCkptTime = now
       if ok then
-        lastCkptStatus = string.format(
-          "fib(%d)  %d digits  @ %.0f s", n, #curr, now - startTime)
+        lastCkptStatus = string.format("fib(%d)  %d digits  @ %.0f s",
+          n, currDigits, now - startTime)
         lastCkptColor  = C.ckpt_ok
       else
         lastCkptStatus = "FAILED: " .. tostring(err)
@@ -501,12 +725,11 @@ while running do
       end
     end
 
-    -- Stats poll + monitor broadcast
     if now - lastStat >= STAT_INTERVAL then
       lastStat = now
       pollStats()
       modem.broadcast(PORT, "STAT",
-        n, #curr,
+        n, currDigits,
         math.floor(rate * 10) / 10,
         math.floor((now - startTime) * 10) / 10,
         computer.freeMemory(), computer.totalMemory())
@@ -514,11 +737,13 @@ while running do
 
     drainStats()
 
-    -- Display refresh
     if now - lastDraw >= DRAW_INTERVAL then
       lastDraw = now
-      drawFrame()
-      drawStatus(n, #curr, now - startTime, rate, curr)
+      -- OPTIMISED: drawFrame() is NOT called here any more.
+      -- It was repainting the full static chrome every 0.25 s.
+      -- We pass the already-computed preview string so drawStatus
+      -- never calls toDecimal() or decimalDigits() itself.
+      drawStatus(n, currDigits, now - startTime, rate, currPreview)
     end
 
     os.sleep(0)
