@@ -1,5 +1,5 @@
 -- =============================================================
---  fibbenchmaster.lua  -  Fibonacci Compute Node  [OPTIMISED]
+--  fibbenchmaster.lua  -  Fibonacci Master Node  [OPTIMISED]
 --
 --  Uses packed integer arrays for faster arbitrary-precision
 --  arithmetic, and stores Fibonacci values to storage nodes as
@@ -40,6 +40,8 @@ local modem = component.modem
 local gpu   = component.isAvailable("gpu") and component.gpu or nil
 local PORT  = 5757
 modem.open(PORT)
+
+local BOOTSTRAP_FIB = tonumber((arg and arg[1]) or (os.getenv and os.getenv("FIB_BOOTSTRAP_N") or "")) or 4096
 
 -- ── Palette ───────────────────────────────────────────────────
 local BG = 0x000000
@@ -222,7 +224,95 @@ local function fastPreview(a, maxLen)
   if #s > maxLen then
     return s:sub(1, maxLen) .. "~"   -- ~ indicates truncation
   end
+
   return s
+end
+
+local function bigmul(a, b)
+  if (#a == 1 and (a[1] or 0) == 0) or (#b == 1 and (b[1] or 0) == 0) then
+    return { 0 }
+  end
+
+  local result = {}
+  for i = 1, #a do
+    local ai = a[i] or 0
+    if ai ~= 0 then
+      local carry = 0
+      for j = 1, #b do
+        local idx = i + j - 1
+        local sum = (result[idx] or 0) + ai * (b[j] or 0) + carry
+        carry = math.floor(sum / LIMB_BASE)
+        result[idx] = sum - carry * LIMB_BASE
+      end
+      local k = i + #b
+      while carry > 0 do
+        local sum = (result[k] or 0) + carry
+        carry = math.floor(sum / LIMB_BASE)
+        result[k] = sum - carry * LIMB_BASE
+        k = k + 1
+      end
+    end
+  end
+  return trimLimbs(result)
+end
+
+local function matrixMul(a, b)
+  return {
+    {
+      bigadd(bigmul(a[1][1], b[1][1]), bigmul(a[1][2], b[2][1])),
+      bigadd(bigmul(a[1][1], b[1][2]), bigmul(a[1][2], b[2][2])),
+    },
+    {
+      bigadd(bigmul(a[2][1], b[1][1]), bigmul(a[2][2], b[2][1])),
+      bigadd(bigmul(a[2][1], b[1][2]), bigmul(a[2][2], b[2][2])),
+    },
+  }
+end
+
+local function bootstrapFibPair(n)
+  if n <= 0 then return { 0 }, { 1 } end
+  local result = {
+    { { 1 }, { 0 } },
+    { { 0 }, { 1 } },
+  }
+  local base = {
+    { { 1 }, { 1 } },
+    { { 1 }, { 0 } },
+  }
+  local exp = n
+  while exp > 0 do
+    if exp % 2 == 1 then
+      result = matrixMul(result, base)
+    end
+    exp = math.floor(exp / 2)
+    if exp > 0 then
+      base = matrixMul(base, base)
+    end
+  end
+  return result[1][2], result[1][1]
+end
+
+local function addChunkWithCarry(a, b, carryIn)
+  local result = {}
+  local carry = carryIn or 0
+  local n = math.max(#a, #b)
+  for i = 1, n do
+    local sum = (a[i] or 0) + (b[i] or 0) + carry
+    if sum >= LIMB_BASE then
+      result[i] = sum - LIMB_BASE
+      carry = 1
+    else
+      result[i] = sum
+      carry = 0
+    end
+  end
+  return result, carry
+end
+
+local function addChunkVariants(a, b)
+  local sum0, carry0 = addChunkWithCarry(a, b, 0)
+  local sum1, carry1 = addChunkWithCarry(a, b, 1)
+  return sum0, carry0, sum1, carry1
 end
 
 -- ── Constants ─────────────────────────────────────────────────
@@ -261,16 +351,30 @@ local function loadCheckpoint()
   return n, ps, cs
 end
 
--- ── Storage node registry ─────────────────────────────────────
-local nodes    = {}
-local nodeList = {}
-local robin    = 0
+-- ── Node registry ────────────────────────────────────────────
+local nodes       = {}   -- storage nodes
+local nodeList    = {}
+local computeNodes = {}
+local computeList  = {}
+local computeRobin = 0
 
 local function sortedNodeList()
   local list = {}
   for i = 1, #nodeList do list[i] = nodeList[i] end
   table.sort(list, function(a, b)
     local na, nb = nodes[a], nodes[b]
+    local fa = na and na.free or 0
+    local fb = nb and nb.free or 0
+    return fa > fb
+  end)
+  return list
+end
+
+local function sortedComputeList()
+  local list = {}
+  for i = 1, #computeList do list[i] = computeList[i] end
+  table.sort(list, function(a, b)
+    local na, nb = computeNodes[a], computeNodes[b]
     local fa = na and na.free or 0
     local fb = nb and nb.free or 0
     return fa > fb
@@ -289,13 +393,22 @@ local function chooseNodeForBytes(bytes)
   return sorted[1]
 end
 
+local function chooseComputeNode()
+  local sorted = sortedComputeList()
+  if #sorted == 0 then
+    return nil
+  end
+  computeRobin = (computeRobin % #sorted) + 1
+  return sorted[computeRobin]
+end
+
 local function waitForReply(addr, expectCmd, timeout)
   local deadline = computer.uptime() + (timeout or 1.5)
   while computer.uptime() < deadline do
-    local ev, _, sender, port, _, cmd, a1, a2, a3, a4 =
+    local ev, _, sender, port, _, cmd, a1, a2, a3, a4, a5, a6 =
       event.pull(deadline - computer.uptime(), "modem_message")
     if ev and sender == addr and port == PORT and cmd == expectCmd then
-      return a1, a2, a3, a4
+      return a1, a2, a3, a4, a5, a6
     end
   end
   return nil, "timeout"
@@ -433,6 +546,7 @@ local function loadNumber(idx, deleteAfter)
     if man.parts then man.parts[part] = addr end
   end
 
+
   return trimLimbs(limbs)
 end
 
@@ -444,37 +558,48 @@ end
 
 cls()
 cprint("+" .. ("-"):rep(W - 2) .. "+", C.border)
-cprint("|" .. pad("  FIBONACCI COMPUTE NODE  [" .. modem.address:sub(1, 8)
+cprint("|" .. pad("  FIBONACCI MASTER NODE  [" .. modem.address:sub(1, 8)
        .. "...]  --  discovery", W - 2) .. "|", C.header)
 cprint("+" .. ("-"):rep(W - 2) .. "+", C.border)
 cprint("|" .. pad("", W - 2) .. "|", C.dim)
-cprint("|" .. pad("  Scanning port " .. PORT .. " for storage nodes ...", W - 2) .. "|", C.label)
+cprint("|" .. pad("  Scanning port " .. PORT .. " for storage and compute nodes ...", W - 2) .. "|", C.label)
 
 modem.broadcast(PORT, "PING")
 local deadline = computer.uptime() + DISCOVERY_TIME
 while computer.uptime() < deadline do
-  local ev, _, sender, port, _, cmd, free, total, cnt =
+  local ev, _, sender, port, _, cmd, free, total, cnt, kind =
     event.pull(deadline - computer.uptime(), "modem_message")
   if ev and port == PORT and cmd == "PONG" then
-    if not nodes[sender] then nodeList[#nodeList + 1] = sender end
-    nodes[sender] = {
-      free    = tonumber(free)  or 0,
-      total   = tonumber(total) or 0,
-      stored  = tonumber(cnt)   or 0,
-      shortId = sender:sub(1, 8),
-    }
-    cprint("|" .. pad(string.format(
-      "  [+] %.8s...  found   %.0f KiB free",
-      sender, (tonumber(free) or 0) / 1024), W - 2) .. "|", C.good)
+    kind = tostring(kind or "storage")
+    if kind == "compute" then
+      if not computeNodes[sender] then computeList[#computeList + 1] = sender end
+      computeNodes[sender] = {
+        free    = tonumber(free)  or 0,
+        total   = tonumber(total) or 0,
+        stored  = tonumber(cnt)   or 0,
+        shortId = sender:sub(1, 8),
+      }
+      cprint("|" .. pad(string.format(
+        "  [C] %.8s...  compute ready   %.0f KiB free",
+        sender, (tonumber(free) or 0) / 1024), W - 2) .. "|", C.good)
+    else
+      if not nodes[sender] then nodeList[#nodeList + 1] = sender end
+      nodes[sender] = {
+        free    = tonumber(free)  or 0,
+        total   = tonumber(total) or 0,
+        stored  = tonumber(cnt)   or 0,
+        shortId = sender:sub(1, 8),
+      }
+      cprint("|" .. pad(string.format(
+        "  [+] %.8s...  found   %.0f KiB free",
+        sender, (tonumber(free) or 0) / 1024), W - 2) .. "|", C.good)
+    end
   end
 end
 
 cprint("|" .. pad("", W - 2) .. "|", C.dim)
-if #nodeList == 0 then
-  cprint("|" .. pad("  [!] No storage nodes found -- running compute-only.", W - 2) .. "|", C.warn)
-else
-  cprint("|" .. pad(string.format("  [*] %d storage node(s) ready.", #nodeList), W - 2) .. "|", C.good)
-end
+cprint("|" .. pad(string.format("  [*] %d storage node(s) ready.", #nodeList), W - 2) .. "|", C.good)
+cprint("|" .. pad(string.format("  [*] %d compute node(s) ready.", #computeList), W - 2) .. "|", C.good)
 cprint("|" .. pad("", W - 2) .. "|", C.dim)
 
 -- ── Checkpoint resume prompt ──────────────────────────────────
@@ -503,9 +628,22 @@ else
 end
 
 if not n then
-  prev = { 0 }
-  curr = { 1 }
-  n = 1
+  if BOOTSTRAP_FIB and BOOTSTRAP_FIB > 1 then
+    cprint("|" .. pad(string.format(
+      "  [*] Bootstrapping with matrix exponentiation to fib(%d)...",
+      BOOTSTRAP_FIB), W - 2) .. "|", C.label)
+    local bootStart = computer.uptime()
+    local bootN = math.max(1, BOOTSTRAP_FIB)
+    prev, curr = bootstrapFibPair(bootN - 1)
+    n = bootN
+    cprint("|" .. pad(string.format(
+      "  [*] Bootstrap complete in %.1f s.", computer.uptime() - bootStart),
+      W - 2) .. "|", C.good)
+  else
+    prev = { 0 }
+    curr = { 1 }
+    n = 1
+  end
 end
 
 cprint("|" .. pad("", W - 2) .. "|", C.dim)
@@ -517,6 +655,7 @@ os.sleep(1)
 local lastStat = 0
 local function pollStats()
   for _, addr in ipairs(nodeList) do modem.send(addr, PORT, "STAT") end
+  for _, addr in ipairs(computeList) do modem.send(addr, PORT, "STAT") end
 end
 
 local function drainStats()
@@ -524,10 +663,16 @@ local function drainStats()
     local ev, _, sender, port, _, cmd, free, total, cnt =
       event.pull(0, "modem_message")
     if not ev then break end
-    if port == PORT and cmd == "STAT" and nodes[sender] then
-      nodes[sender].free   = tonumber(free)  or nodes[sender].free
-      nodes[sender].total  = tonumber(total) or nodes[sender].total
-      nodes[sender].stored = tonumber(cnt)   or nodes[sender].stored
+    if port == PORT and cmd == "STAT" then
+      if nodes[sender] then
+        nodes[sender].free   = tonumber(free)  or nodes[sender].free
+        nodes[sender].total  = tonumber(total) or nodes[sender].total
+        nodes[sender].stored = tonumber(cnt)   or nodes[sender].stored
+      elseif computeNodes[sender] then
+        computeNodes[sender].free   = tonumber(free)  or computeNodes[sender].free
+        computeNodes[sender].total  = tonumber(total) or computeNodes[sender].total
+        computeNodes[sender].stored = tonumber(cnt)   or computeNodes[sender].stored
+      end
     end
   end
 end
@@ -578,7 +723,7 @@ local function drawFrame()
 
   hline(1)
   put(1, 2, "|", C.border)
-  put(2, 2, pad("  FIBONACCI COMPUTE NODE  [" .. modem.address:sub(1, 8) .. "...]", W - 2), C.header)
+  put(2, 2, pad("  FIBONACCI MASTER NODE  [" .. modem.address:sub(1, 8) .. "...]", W - 2), C.header)
   put(W, 2, "|", C.border)
   hline(3)
 
@@ -639,7 +784,8 @@ local function drawStatus(nVal, digits, elapsed, rate, previewStr)
     "queue", string.format("%d buffered", #sendQueue), #sendQueue > 0 and C.warn or C.value)
   statRow(6,
     "elapsed", string.format("%.1f s", elapsed), C.value,
-    "nodes", string.format("%d storage", #nodeList), #nodeList > 0 and C.good or C.warn)
+    "nodes", string.format("%d storage / %d compute", #nodeList, #computeList),
+    (#nodeList + #computeList) > 0 and C.good or C.warn)
 
   put(2,  8, " value  : ", C.label)
   put(11, 8, pad(trunc(previewStr, W - 12), W - 12), C.preview)
@@ -662,8 +808,97 @@ local function drawStatus(nVal, digits, elapsed, rate, previewStr)
   end
 end
 
+local function parallelBigAdd(a, b)
+  local width = math.max(#a, #b)
+  local total = math.max(1, math.ceil(width / CHUNK_LIMBS))
+  local jobId = tostring(computer.uptime()) .. "-" .. tostring(math.random(100000, 999999))
+  local replies = {}
+  local taskInputs = {}
+
+  local expected = 0
+  for part = 1, total do
+    local startIdx = (part - 1) * CHUNK_LIMBS + 1
+    local stopIdx  = math.min(width, startIdx + CHUNK_LIMBS - 1)
+    local chunkA, chunkB = {}, {}
+    for i = startIdx, stopIdx do
+      chunkA[#chunkA + 1] = a[i] or 0
+      chunkB[#chunkB + 1] = b[i] or 0
+    end
+    if #chunkA == 0 then chunkA[1] = 0 end
+    if #chunkB == 0 then chunkB[1] = 0 end
+
+    taskInputs[part] = { chunkA, chunkB }
+
+    local worker = chooseComputeNode()
+    if worker then
+      modem.send(worker, PORT, "ADDJOB", jobId, tostring(part), tostring(total),
+        encodeChunk(chunkA), encodeChunk(chunkB))
+      expected = expected + 1
+    else
+      local sum0, carry0, sum1, carry1 = addChunkVariants(chunkA, chunkB)
+      replies[part] = { sum0 = sum0, carry0 = carry0, sum1 = sum1, carry1 = carry1 }
+    end
+  end
+
+  local deadline = computer.uptime() + 10.0
+  while expected > 0 do
+    local timeout = math.max(0, deadline - computer.uptime())
+    local ev, _, sender, port, _, cmd, a1, a2, a3, a4, a5, a6 =
+      event.pull(timeout, "modem_message")
+    if not ev then
+      for part = 1, total do
+        if not replies[part] then
+          local pair = taskInputs[part]
+          local sum0, carry0, sum1, carry1 = addChunkVariants(pair[1], pair[2])
+          replies[part] = { sum0 = sum0, carry0 = carry0, sum1 = sum1, carry1 = carry1 }
+        end
+      end
+      expected = 0
+    elseif port == PORT and cmd == "ADDRES" and a1 == jobId then
+      local part = tonumber(a2)
+      if part and not replies[part] then
+        replies[part] = {
+          sum0 = decodeChunk(a3), carry0 = tonumber(a4) or 0,
+          sum1 = decodeChunk(a5), carry1 = tonumber(a6) or 0,
+        }
+        expected = expected - 1
+      end
+    end
+  end
+
+  local result = {}
+  local carry = 0
+  for part = 1, total do
+    local rec = replies[part]
+    if not rec then
+      rec = { sum0 = { 0 }, carry0 = 0, sum1 = { 0 }, carry1 = 0 }
+    end
+
+    local chosen, nextCarry
+    if carry == 0 then
+      chosen, nextCarry = rec.sum0, rec.carry0
+    else
+      chosen, nextCarry = rec.sum1, rec.carry1
+    end
+
+    modem.broadcast(PORT, "CHUNK", jobId, tostring(part), tostring(total),
+      tostring(carry), tostring(nextCarry), encodeChunk(chosen))
+
+    for i = 1, #chosen do
+      result[#result + 1] = chosen[i]
+    end
+    carry = nextCarry
+  end
+
+  if carry > 0 then
+    result[#result + 1] = carry
+  end
+
+  return trimLimbs(result)
+end
+
 -- ── Seed storage and run ──────────────────────────────────────
-if not resumedFrom then
+if not resumedFrom and not (BOOTSTRAP_FIB and BOOTSTRAP_FIB > 1) then
   table.insert(sendQueue, { 0, { 0 } })
   table.insert(sendQueue, { 1, { 1 } })
 end
@@ -681,7 +916,7 @@ local running = true
 event.listen("interrupted", function() running = false end)
 
 while running do
-  local nextVal = bigadd(prev, curr)
+  local nextVal = parallelBigAdd(prev, curr)
   n = n + 1
   prev = curr
   curr = nextVal
