@@ -1,310 +1,282 @@
--- =============================================================
---  fibbenchcompute.lua  -  Fibonacci Compute Worker
+-- fibbenchcompute.lua
 --
---  Standalone worker for the Fibonacci master.
---  Handles PING, STAT, ADDJOB, and CHUNK broadcasts.
+-- FibBench COMPUTE node.
 --
---  UI notes:
---    - Shows only this node's own information.
---    - Uses a compact dashboard similar to the master styling.
---    - No storage node lists, no master-wide status.
--- =============================================================
+-- Role: registers with a master, then executes small "add this chunk"
+-- tasks on demand. It never holds more than one chunk's worth of limbs
+-- in memory at a time - it fetches the two input chunks from whichever
+-- storage nodes hold them, adds them with the carry assumption the
+-- master gave it, writes the result chunk back out to a storage node,
+-- and reports the resulting carry bit. This keeps its own memory
+-- footprint flat regardless of how large the overall Fibonacci number
+-- has grown.
+--
+-- Run with: fibbenchcompute
 
-local component = require("component")
-local computer  = require("computer")
-local event     = require("event")
-local term      = require("term")
+local event = require("event")
+local term  = require("term")
 
-if not component.isAvailable("modem") then
-  error("No modem found - install a network card!")
+local scriptDir = (...) and (...):match("(.*/)") or ""
+if scriptDir == "" then
+  local ok, shell = pcall(require, "shell")
+  if ok then
+    local resolved = shell.resolve("fibbenchcompute.lua")
+    if resolved then scriptDir = resolved:match("(.*/)") or "" end
+  end
+end
+local common = dofile(scriptDir .. "fibbenchcommon.lua")
+local ui, net, util, bigint = common.ui, common.net, common.util, common.bigint
+local keys = net.keyboard.keys
+local computer = require("computer")
+
+------------------------------------------------------------------
+-- Setup
+------------------------------------------------------------------
+
+local gpu, W, H = ui.init("FibBench Compute Node")
+ui.box(2, 2, W - 2, 5, "Connection")
+ui.box(2, 8, W - 2, 6, "Current Task")
+ui.box(2, 15, W - 2, H - 16, "Log")
+local logPanel = ui.newLog(3, 16, W - 4, H - 18)
+
+local modems = net.openModems()
+local myId = net.myAddress(modems)
+if #modems == 0 then
+  logPanel:push("WARNING: no modem found - cannot join a network.", ui.palette.bad)
 end
 
-local modem = component.modem
-local gpu   = component.isAvailable("gpu") and component.gpu or nil
-local PORT  = 5757
-modem.open(PORT)
-
-local LIMB_BASE = 10000000
-local LIMB_WIDTH = 7
-local CHUNK_LIMBS = 64
-
--- ── Palette ───────────────────────────────────────────────────
-local BG = 0x000000
-local C = {
-  border   = 0x1A4A7A,
-  header   = 0x33AAFF,
-  label    = 0x778899,
-  value    = 0xEEEEEE,
-  number   = 0xFFDD44,
-  good     = 0x44CC44,
-  warn     = 0xFF9900,
-  bad      = 0xFF4444,
-  dim      = 0x333344,
-  preview  = 0x88CCFF,
-  ckpt_ok  = 0x44DD88,
-  node_id  = 0xAABBCC,
+local state = {
+  connected = false,
+  masterAddr = nil,
+  masterName = nil,
+  seriesId = nil,
+  lastMasterSeen = 0,
+  tasksDone = 0,
+  tasksFailed = 0,
+  busy = false,
+  currentTask = nil,
 }
 
-local W, H = 80, 25
-if gpu then W, H = gpu.getResolution() end
+local replyCounter = 0
+local function nextReplyId()
+  replyCounter = replyCounter + 1
+  return myId .. "-r" .. replyCounter
+end
 
-local function cls()
-  if gpu then
-    gpu.setBackground(BG)
-    gpu.setForeground(C.value)
-    gpu.fill(1, 1, W, H, " ")
+local function drawConnection()
+  ui.clearArea(4, 3, W - 6, 3)
+  if state.connected then
+    ui.text(4, 3, "Status:  CONNECTED", ui.palette.good)
+    ui.text(4, 4, "Master:  " .. util.shortId(state.masterAddr) .. "  (" .. (state.masterName or "?") .. ")", ui.palette.text)
+    ui.text(4, 5, "Series:  " .. (state.seriesId or "-") .. "   Tasks OK: " .. state.tasksDone ..
+      "   Failed: " .. state.tasksFailed, ui.palette.dim)
   else
-    term.clear()
+    ui.text(4, 3, "Status:  SEARCHING FOR MASTER...", ui.palette.warn)
+    ui.text(4, 4, "My address: " .. util.shortId(myId), ui.palette.dim)
   end
 end
 
-local function put(x, y, text, fg, bg)
-  if not gpu or y < 1 or y > H or x > W then return end
-  gpu.setBackground(bg or BG)
-  gpu.setForeground(fg or C.value)
-  local s = tostring(text or "")
-  if x < 1 then s = s:sub(2 - x); x = 1 end
-  if x + #s - 1 > W then s = s:sub(1, W - x + 1) end
-  if #s > 0 then gpu.set(x, y, s) end
-end
-
-local function hline(y, fg)
-  put(1, y, "+" .. ("-"):rep(W - 2) .. "+", fg or C.border)
-end
-
-local function pad(s, w)
-  s = tostring(s or "")
-  if #s > w then return s:sub(1, w) end
-  return s .. (" "):rep(w - #s)
-end
-
-local function trunc(s, max)
-  s = tostring(s or "")
-  if #s <= max then return s end
-  local h = math.floor((max - 3) / 2)
-  return s:sub(1, h) .. "..." .. s:sub(-(max - h - 3))
-end
-
-local function drawBar(x, y, barW, free, total)
-  local pct = (total > 0) and (1 - free / total) or 0
-  local filled = math.max(0, math.min(barW, math.floor(pct * barW)))
-  local col = (pct < 0.5) and C.good or (pct < 0.8) and C.warn or C.bad
-  put(x,              y, "[",                      C.border)
-  put(x + 1,          y, ("#"):rep(filled),        col)
-  put(x + 1 + filled, y, ("."):rep(barW - filled), C.dim)
-  put(x + barW + 1,   y, "]",                      C.border)
-  put(x + barW + 3,   y, string.format("%3d%%", math.floor(pct * 100)), col)
-end
-
-local function cprint(text, fg)
-  if gpu then gpu.setForeground(fg or C.value); gpu.setBackground(BG) end
-  print(tostring(text))
-end
-
-local function decodeChunk(payload)
-  payload = tostring(payload or "")
-  if payload == "" then return { 0 } end
-  local chunk = {}
-  for token in payload:gmatch("[^,]+") do
-    chunk[#chunk + 1] = tonumber(token) or 0
+local function drawTask()
+  ui.clearArea(4, 9, W - 6, 4)
+  if state.busy and state.currentTask then
+    local t = state.currentTask
+    ui.text(4, 9, string.format("Chunk #%d   carryIn=%d   limbsPerChunk=%d", t.chunkIndex, t.carryIn, t.limbsPerChunk), ui.palette.accent2)
+    ui.text(4, 10, "Stage: " .. (t.stage or "?"), ui.palette.text)
+  else
+    ui.text(4, 9, "Idle - waiting for work...", ui.palette.dim)
   end
-  if #chunk == 0 then chunk[1] = 0 end
-  return chunk
 end
 
-local function encodeChunk(chunk)
-  local out = {}
-  for i = 1, #chunk do out[i] = tostring(chunk[i] or 0) end
-  return table.concat(out, ",")
+local function drawFooter()
+  ui.footer(string.format("free mem: %s   |   q = quit and deregister",
+    util.formatBytes(computer.freeMemory())))
 end
 
-local function addChunkWithCarry(a, b, carryIn)
-  local result = {}
-  local carry = carryIn or 0
-  local n = math.max(#a, #b)
-  for i = 1, n do
-    local sum = (a[i] or 0) + (b[i] or 0) + carry
-    if sum >= LIMB_BASE then
-      result[i] = sum - LIMB_BASE
-      carry = 1
-    else
-      result[i] = sum
-      carry = 0
+drawConnection()
+drawTask()
+drawFooter()
+logPanel:push("Compute node ready. Address: " .. util.shortId(myId), ui.palette.accent)
+
+------------------------------------------------------------------
+-- Task execution
+------------------------------------------------------------------
+
+-- Fetch a chunk of limbs from a storage node, or return a zero chunk
+-- if ref is nil (meaning "this operand doesn't have a chunk here").
+local function fetchChunk(ref, limbsPerChunk)
+  if ref == nil then
+    return bigint.zeroChunk(limbsPerChunk), true
+  end
+  local req = { type = "fetch_chunk", replyId = nextReplyId(), path = ref.path, from = myId }
+  local reply = net.request(modems, ref.node, req, "chunk_data", { attempts = 4, perWait = 3 })
+  if not reply or not reply.ok then
+    return nil, false, reply and reply.err or "no reply from storage node"
+  end
+  return reply.data, true
+end
+
+local function storeChunk(ref, data)
+  local req = { type = "store_chunk", replyId = nextReplyId(), path = ref.path, data = data, from = myId }
+  local reply = net.request(modems, ref.node, req, "store_ack", { attempts = 4, perWait = 3 })
+  if not reply or not reply.ok then
+    return false, reply and reply.err or "no reply from storage node"
+  end
+  return true
+end
+
+local function executeTask(task)
+  state.busy = true
+  state.currentTask = task
+  task.stage = "fetching operand A"
+  drawTask()
+  local chunkA, okA, errA = fetchChunk(task.aRef, task.limbsPerChunk)
+  if not okA then
+    return false, "fetch A failed: " .. tostring(errA)
+  end
+
+  task.stage = "fetching operand B"
+  drawTask()
+  local chunkB, okB, errB = fetchChunk(task.bRef, task.limbsPerChunk)
+  if not okB then
+    return false, "fetch B failed: " .. tostring(errB)
+  end
+
+  task.stage = "adding"
+  drawTask()
+  local resultChunk, carryOut = bigint.chunkAdd(chunkA, chunkB, task.carryIn, task.limbsPerChunk)
+
+  task.stage = "storing result"
+  drawTask()
+  local okStore, errStore = storeChunk(task.resultRef, resultChunk)
+  if not okStore then
+    return false, "store failed: " .. tostring(errStore)
+  end
+
+  return true, nil, carryOut
+end
+
+------------------------------------------------------------------
+-- Message handling
+------------------------------------------------------------------
+
+local function sendHello()
+  net.broadcast(modems, {
+    type = "hello_compute", role = "compute", id = myId,
+    memFree = computer.freeMemory(), memTotal = computer.totalMemory(),
+  })
+end
+
+local function handleTask(msg, remoteAddr)
+  if state.busy then
+    -- Already working (shouldn't normally happen; master tracks busy
+    -- state) - politely refuse so the master reassigns promptly.
+    net.send(modems, remoteAddr, {
+      type = "task_done", taskId = msg.taskId, chunkIndex = msg.chunkIndex,
+      carryIn = msg.carryIn, ok = false, err = "worker busy",
+    })
+    return
+  end
+
+  local ok, err, carryOut = executeTask({
+    chunkIndex = msg.chunkIndex, carryIn = msg.carryIn, limbsPerChunk = msg.limbsPerChunk,
+    aRef = msg.aRef, bRef = msg.bRef, resultRef = msg.resultRef,
+  })
+
+  state.busy = false
+  state.currentTask = nil
+  if ok then
+    state.tasksDone = state.tasksDone + 1
+    logPanel:push(string.format("chunk %d (carryIn=%d) done -> carryOut=%d",
+      msg.chunkIndex, msg.carryIn, carryOut), ui.palette.text)
+  else
+    state.tasksFailed = state.tasksFailed + 1
+    logPanel:push(string.format("chunk %d (carryIn=%d) FAILED: %s",
+      msg.chunkIndex, msg.carryIn, tostring(err)), ui.palette.bad)
+  end
+  drawConnection()
+  drawTask()
+
+  net.send(modems, state.masterAddr or remoteAddr, {
+    type = "task_done", taskId = msg.taskId, chunkIndex = msg.chunkIndex,
+    carryIn = msg.carryIn, carryOut = carryOut, ok = ok, err = err,
+    resultRef = msg.resultRef,
+  })
+end
+
+local function handleMessage(msg, remoteAddr)
+  if msg.type == "welcome" and msg.to == myId then
+    state.connected = true
+    state.masterAddr = remoteAddr
+    state.masterName = msg.name
+    state.seriesId = msg.seriesId
+    state.lastMasterSeen = computer.uptime()
+    logPanel:push("Registered with master " .. util.shortId(remoteAddr) .. " as " .. tostring(msg.name), ui.palette.good)
+    drawConnection()
+
+  elseif msg.type == "master_shutdown" then
+    if state.connected and remoteAddr == state.masterAddr then
+      logPanel:push("Master shut down. Returning to search mode.", ui.palette.warn)
+      state.connected = false
+      state.masterAddr = nil
+      drawConnection()
     end
+
+  elseif msg.type == "task_chunk_add" then
+    if not state.connected or remoteAddr ~= state.masterAddr then
+      return -- ignore tasks from anyone but our current master
+    end
+    state.lastMasterSeen = computer.uptime()
+    handleTask(msg, remoteAddr)
   end
-  return result, carry
 end
 
-local function addChunkVariants(a, b)
-  local sum0, carry0 = addChunkWithCarry(a, b, 0)
-  local sum1, carry1 = addChunkWithCarry(a, b, 1)
-  return sum0, carry0, sum1, carry1
-end
+------------------------------------------------------------------
+-- Main loop
+------------------------------------------------------------------
 
--- ── Local node state ──────────────────────────────────────────
-local bootTime = computer.uptime()
-local startFree = computer.freeMemory()
-local startTotal = computer.totalMemory()
+sendHello()
+local lastHelloOrHeartbeat = computer.uptime()
 
-local lastFree = startFree
-local lastTotal = startTotal
-local jobsSeen = 0
-local jobsDone = 0
-local chunksSeen = 0
-local lastCmd = "idle"
-local lastJobId = "-"
-local lastPart = 0
-local lastTotalParts = 0
-local lastCarryOut = 0
-local lastResultLimbs = 0
-local lastPeer = "-"
-local lastActivity = bootTime
-
-local function refreshStats()
-  lastFree = computer.freeMemory()
-  lastTotal = computer.totalMemory()
-end
-
--- ── UI ────────────────────────────────────────────────────────
-local BAR_W = math.max(6, W - 20)
-
-local function drawFrame()
-  cls()
-  hline(1)
-  put(1, 2, "|", C.border)
-  put(2, 2, pad("  FIBONACCI COMPUTE NODE  [" .. modem.address:sub(1, 8) .. "...]", W - 2), C.header)
-  put(W, 2, "|", C.border)
-  hline(3)
-
-  for row = 4, 6 do
-    put(1, row, "|", C.border)
-    put(W, row, "|", C.border)
-  end
-  hline(7)
-
-  put(1, 8, "|", C.border); put(W, 8, "|", C.border)
-  hline(9)
-
-  put(1, 10, "|", C.border); put(W, 10, "|", C.border)
-  put(1, 11, "|", C.border); put(W, 11, "|", C.border)
-  hline(12)
-
-  put(2, 13, pad("  THIS NODE", W - 2), C.header)
-  hline(14)
-end
-
-local function statRow(y, lLbl, lVal, lCol, rLbl, rVal, rCol)
-  local mid = math.floor(W / 2)
-  put(2,        y, " " .. pad(lLbl, 8) .. " : ",      C.label)
-  put(13,       y, pad(tostring(lVal), mid - 14),        lCol or C.number)
-  put(mid + 1,  y, " " .. pad(rLbl, 8) .. " : ",      C.label)
-  put(mid + 12, y, pad(tostring(rVal), W - mid - 13),   rCol or C.number)
-end
-
-local function drawStatus()
-  local uptime = computer.uptime() - bootTime
-  local memUsed = lastTotal - lastFree
-
-  statRow(4,
-    "role", "compute", C.good,
-    "port", PORT, C.number)
-  statRow(5,
-    "uptime", string.format("%.1f s", uptime), C.value,
-    "jobs", string.format("%d/%d", jobsDone, jobsSeen), C.good)
-  statRow(6,
-    "chunks", tostring(chunksSeen), C.number,
-    "last cmd", lastCmd, C.preview)
-
-  put(2,  8, " node id : ", C.label)
-  put(12, 8, pad(modem.address, W - 13), C.node_id)
-
-  put(2, 10, " memory  ", C.label)
-  drawBar(13, 10, BAR_W, lastFree, lastTotal)
-  put(W - 18, 10, pad(string.format("%d KiB", math.floor(memUsed / 1024)), 17), C.value)
-
-  put(2, 11, " peer    : ", C.label)
-  put(13, 11, pad(trunc(lastPeer, W - 14), W - 14), C.preview)
-
-  put(2, 15, " last job : ", C.label)
-  put(13, 15, pad(string.format("%s  part %d/%d", lastJobId, lastPart, lastTotalParts), W - 14), C.value)
-  put(2, 16, " result   : ", C.label)
-  put(13, 16, pad(string.format("%d limb(s), carry %d", lastResultLimbs, lastCarryOut), W - 14), C.value)
-
-  put(2, 18, " activity : ", C.label)
-  put(13, 18, pad(string.format("%.1f s ago", computer.uptime() - lastActivity), W - 14), C.preview)
-end
-
--- ── Startup UI ────────────────────────────────────────────────
-drawFrame()
-refreshStats()
-drawStatus()
-
-cprint("+" .. ("-"):rep(W - 2) .. "+", C.border)
-cprint("|" .. pad("  FIBONACCI COMPUTE NODE  [" .. modem.address:sub(1, 8) .. "...]  --  online", W - 2) .. "|", C.header)
-cprint("+" .. ("-"):rep(W - 2) .. "+", C.border)
-cprint("|" .. pad("  Waiting for master jobs on port " .. PORT .. " ...", W - 2) .. "|", C.label)
-cprint("|" .. pad("  This panel shows only this node's own state.", W - 2) .. "|", C.dim)
-cprint("+" .. ("-"):rep(W - 2) .. "+", C.border)
-
--- ── Main loop ────────────────────────────────────────────────
 local running = true
-event.listen("interrupted", function() running = false end)
-
-local lastDraw = 0
-local DRAW_INTERVAL = 0.25
-
 while running do
-  local ev, _, sender, port, _, cmd, a1, a2, a3, a4, a5, a6 =
-    event.pull(DRAW_INTERVAL, "modem_message")
-
-  if ev and port == PORT then
-    lastPeer = tostring(sender or "-")
-    lastCmd = tostring(cmd or "unknown")
-    lastActivity = computer.uptime()
-
-    if cmd == "PING" then
-      refreshStats()
-      modem.send(sender, PORT, "PONG", lastFree, lastTotal, 0, "compute")
-      cprint(string.format("[PING] from %.8s...", sender), C.dim)
-
-    elseif cmd == "STAT" then
-      refreshStats()
-      modem.send(sender, PORT, "STAT", lastFree, lastTotal, 0, "compute")
-      cprint(string.format("[STAT] from %.8s...", sender), C.dim)
-
-    elseif cmd == "ADDJOB" then
-      jobsSeen = jobsSeen + 1
-      local jobId  = tostring(a1 or "")
-      local part   = tonumber(a2) or 0
-      local total  = tonumber(a3) or 0
-      local chunkA = decodeChunk(a4)
-      local chunkB = decodeChunk(a5)
-      local sum0, carry0, sum1, carry1 = addChunkVariants(chunkA, chunkB)
-      jobsDone = jobsDone + 1
-      lastJobId = jobId
-      lastPart = part
-      lastTotalParts = total
-      lastCarryOut = carry1
-      lastResultLimbs = math.max(#sum0, #sum1)
-      refreshStats()
-      modem.send(sender, PORT, "ADDRES",
-        jobId, tostring(part), encodeChunk(sum0), tostring(carry0),
-        encodeChunk(sum1), tostring(carry1))
-
-    elseif cmd == "CHUNK" then
-      chunksSeen = chunksSeen + 1
-      -- Broadcast only. No persistence required on workers.
+  local msg, remoteAddr = net.pull(2)
+  if msg then
+    local ok, err = pcall(handleMessage, msg, remoteAddr)
+    if not ok then
+      logPanel:push("handler error: " .. tostring(err), ui.palette.bad)
     end
   end
 
-  if computer.uptime() - lastDraw >= DRAW_INTERVAL then
-    lastDraw = computer.uptime()
-    refreshStats()
-    drawStatus()
+  local now = computer.uptime()
+  if not state.connected and (now - lastHelloOrHeartbeat) >= 2 then
+    sendHello()
+    lastHelloOrHeartbeat = now
+  elseif state.connected then
+    if not state.busy and (now - lastHelloOrHeartbeat) >= common.HEARTBEAT_INTERVAL then
+      net.send(modems, state.masterAddr, {
+        type = "heartbeat", id = myId, role = "compute",
+        stats = { tasksDone = state.tasksDone, tasksFailed = state.tasksFailed, freeMem = computer.freeMemory() },
+      })
+      lastHelloOrHeartbeat = now
+    end
+    if state.lastMasterSeen > 0 and (now - state.lastMasterSeen) > common.HEARTBEAT_TIMEOUT then
+      logPanel:push("Lost contact with master. Returning to search mode.", ui.palette.warn)
+      state.connected = false
+      state.masterAddr = nil
+      drawConnection()
+    end
+  end
+
+  drawFooter()
+
+  local ev, _, _char, code = event.pull(0, "key_down")
+  if ev and code == keys.q then
+    running = false
   end
 end
 
-modem.close(PORT)
-if gpu then gpu.setForeground(C.value); gpu.setBackground(BG) end
-term.setCursor(1, H)
-print("\nStopped compute node at " .. modem.address .. ".")
+if state.connected then
+  net.send(modems, state.masterAddr, { type = "bye", id = myId, role = "compute" })
+end
+term.clear()
+print("FibBench compute node stopped.")

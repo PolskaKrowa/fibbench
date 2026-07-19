@@ -1,949 +1,706 @@
--- =============================================================
---  fibbenchmaster.lua  -  Fibonacci Master Node  [OPTIMISED]
+-- fibbenchmaster.lua
 --
---  Uses packed integer arrays for faster arbitrary-precision
---  arithmetic, and stores Fibonacci values to storage nodes as
---  limb chunks so the rack acts like distributed swap.
+-- FibBench MASTER node.
 --
--- =============================================================
+-- Role:
+--   1. BOOTSTRAP: locally (fast doubling / matrix-identity recursion)
+--      compute the largest Fibonacci number that fits in half of this
+--      machine's own memory, plus the one before it - "two for the
+--      price of one" - using a runtime-calibrated memory estimate
+--      rather than a guessed constant.
+--   2. Once at least one storage node has joined, that pair of huge
+--      numbers is split into fixed-size limb "chunks" and handed off
+--      to the storage network, freeing the master's own RAM back down
+--      to near nothing.
+--   3. GROWTH: forever after, the master advances the sequence one
+--      Fibonacci step at a time (A,B -> B,A+B) by handing out tiny
+--      "add this chunk, assuming carry-in X" tasks to compute nodes.
+--      Both carryIn=0 and carryIn=1 are dispatched for every chunk in
+--      parallel (a "carry-select adder", borrowed from hardware
+--      design) so the whole step parallelises across however many
+--      compute nodes are connected, instead of being a strict
+--      chunk-by-chunk ripple chain. The master only ever resolves a
+--      handful of carry BITS itself - never full chunk data - so its
+--      own memory usage stays flat no matter how large the number
+--      that the network as a whole is holding gets.
+--   4. Workers (compute or storage) may join or leave at any time;
+--      the master re-balances automatically and requeues any task an
+--      unresponsive worker was holding.
+--   5. Progress is checkpointed to disk periodically (and on request/
+--      quit) so the whole network can pick up where it left off after
+--      a crash or restart, as long as the storage nodes referenced in
+--      the checkpoint eventually come back online.
+--
+-- Run with: fibbenchmaster
 
-local component = require("component")
-local computer  = require("computer")
-local event     = require("event")
-local term      = require("term")
-local fs        = require("filesystem")
+local event = require("event")
+local term  = require("term")
+local computer = require("computer")
 
-if not component.isAvailable("modem") then
-  error("No modem found - install a network card!")
+local scriptDir = (...) and (...):match("(.*/)") or ""
+if scriptDir == "" then
+  local ok, shell = pcall(require, "shell")
+  if ok then
+    local resolved = shell.resolve("fibbenchmaster.lua")
+    if resolved then scriptDir = resolved:match("(.*/)") or "" end
+  end
+end
+local common = dofile(scriptDir .. "fibbenchcommon.lua")
+local ui, net, util, bigint = common.ui, common.net, common.util, common.bigint
+local keys = net.keyboard.keys
+
+local CHECKPOINT_PATH = scriptDir .. "fibbench_checkpoint.chk"
+local CHECKPOINT_EVERY_STEPS = 10
+local CHECKPOINT_EVERY_SECONDS = 120
+
+------------------------------------------------------------------
+-- TUI setup
+------------------------------------------------------------------
+
+local gpu, W, H = ui.init("FibBench Master")
+local netBoxH = math.max(8, math.floor(H * 0.35))
+ui.box(2, 2, math.floor(W/2) - 1, netBoxH, "Network")
+ui.box(math.floor(W/2) + 1, 2, W - math.floor(W/2) - 2, netBoxH, "Progress")
+ui.box(2, 2 + netBoxH, W - 2, H - 3 - netBoxH, "Log")
+local logPanel = ui.newLog(3, 3 + netBoxH, W - 4, H - 5 - netBoxH)
+
+local function log(msg, color) logPanel:push(msg, color) end
+
+------------------------------------------------------------------
+-- Networking + node registry
+------------------------------------------------------------------
+
+local modems = net.openModems()
+local myId = net.myAddress(modems)
+if #modems == 0 then
+  log("WARNING: no modem found - the network cannot form.", ui.palette.bad)
 end
 
-local modem = component.modem
-local gpu   = component.isAvailable("gpu") and component.gpu or nil
-local PORT  = 5757
-modem.open(PORT)
+local nodes = {}       -- [addr] = {role, name, lastSeen, busy, stats}
+local computeOrder = {} -- addresses, for round robin
+local storageOrder = {} -- addresses, for round robin
+local nextComputeNum, nextStorageNum = 1, 1
+local rrComputeIdx, rrStorageIdx = 1, 1
 
-local BOOTSTRAP_FIB = tonumber((arg and arg[1]) or (os.getenv and os.getenv("FIB_BOOTSTRAP_N") or "")) or 4096
+local function computeNodes()
+  local out = {}
+  for _, addr in ipairs(computeOrder) do
+    if nodes[addr] then out[#out+1] = addr end
+  end
+  return out
+end
 
--- ── Palette ───────────────────────────────────────────────────
-local BG = 0x000000
-local C = {
-  border   = 0x1A4A7A,
-  header   = 0x33AAFF,
-  label    = 0x778899,
-  value    = 0xEEEEEE,
-  number   = 0xFFDD44,
-  good     = 0x44CC44,
-  warn     = 0xFF9900,
-  bad      = 0xFF4444,
-  dim      = 0x333344,
-  preview  = 0x88CCFF,
-  ckpt_ok  = 0x44DD88,
-  node_id  = 0xAABBCC,
+local function storageNodes()
+  local out = {}
+  for _, addr in ipairs(storageOrder) do
+    if nodes[addr] then out[#out+1] = addr end
+  end
+  return out
+end
+
+local function pickStorageNode()
+  local pool = storageNodes()
+  if #pool == 0 then return nil end
+  rrStorageIdx = (rrStorageIdx % #pool) + 1
+  return pool[rrStorageIdx]
+end
+
+local function pickIdleComputeNode()
+  local pool = computeNodes()
+  if #pool == 0 then return nil end
+  for _ = 1, #pool do
+    rrComputeIdx = (rrComputeIdx % #pool) + 1
+    local addr = pool[rrComputeIdx]
+    if nodes[addr] and not nodes[addr].busy then return addr end
+  end
+  return nil
+end
+
+local function registerNode(addr, role, extra)
+  if nodes[addr] then
+    nodes[addr].lastSeen = computer.uptime()
+    for k, v in pairs(extra or {}) do nodes[addr][k] = v end
+    return nodes[addr], false
+  end
+  local name
+  if role == "compute" then
+    name = "Compute-" .. nextComputeNum; nextComputeNum = nextComputeNum + 1
+    computeOrder[#computeOrder+1] = addr
+  else
+    name = "Storage-" .. nextStorageNum; nextStorageNum = nextStorageNum + 1
+    storageOrder[#storageOrder+1] = addr
+  end
+  nodes[addr] = { role = role, name = name, lastSeen = computer.uptime(), busy = false, stats = extra or {} }
+  return nodes[addr], true
+end
+
+local function dropNode(addr)
+  nodes[addr] = nil
+end
+
+------------------------------------------------------------------
+-- Chunk-level helpers (master's own fetch/store/delete requests -
+-- used for bootstrap seeding, the rare top-chunk-extend case, and
+-- periodic exact-digit-count display)
+------------------------------------------------------------------
+
+local replyCounter = 0
+local function nextReplyId()
+  replyCounter = replyCounter + 1
+  return myId .. "-m" .. replyCounter
+end
+
+local function masterStoreChunk(nodeAddr, path, data)
+  local req = { type = "store_chunk", replyId = nextReplyId(), path = path, data = data, from = myId }
+  local reply = net.request(modems, nodeAddr, req, "store_ack", { attempts = 5, perWait = 3 })
+  return reply ~= nil and reply.ok, reply and reply.err
+end
+
+local function masterFetchChunk(nodeAddr, path)
+  local req = { type = "fetch_chunk", replyId = nextReplyId(), path = path, from = myId }
+  local reply = net.request(modems, nodeAddr, req, "chunk_data", { attempts = 3, perWait = 3 })
+  if not reply or not reply.ok then return nil, reply and reply.err or "timeout" end
+  return reply.data
+end
+
+local function masterDeleteChunk(nodeAddr, path)
+  net.send(modems, nodeAddr, { type = "delete_chunk", path = path, from = myId })
+end
+
+local function digitsFromTopChunk(topChunk, limbsPerChunk, totalChunkCount)
+  local top = 1
+  for i = limbsPerChunk, 1, -1 do
+    if (topChunk[i] or 0) ~= 0 then top = i; break end
+  end
+  local leadDigits = #tostring(topChunk[top] or 0)
+  local digitsInTopChunk = (top - 1) * bigint.DIGITS_PER_LIMB + leadDigits
+  return (totalChunkCount - 1) * limbsPerChunk * bigint.DIGITS_PER_LIMB + digitsInTopChunk
+end
+
+------------------------------------------------------------------
+-- Run state
+------------------------------------------------------------------
+
+local state = {
+  phase = "INIT",           -- INIT, BOOTSTRAP, WAITING_FOR_STORAGE, SEEDING_STORAGE, GROWING
+  seriesId = nil,
+  n = 0,                    -- Fibonacci index currently represented by B
+  limbsPerChunk = common.DEFAULT_CHUNK_LIMBS,
+  A = nil,                  -- {chunkCount=, manifest={[i]={node=,path=}}}
+  B = nil,
+  stepsCompleted = 0,
+  paused = false,
+  startTime = computer.uptime(),
+  lastCheckpointTime = 0,
+  lastDigits = nil,
+  lastStepDurations = {},
 }
 
-local W, H = 80, 25
-if gpu then W, H = gpu.getResolution() end
+------------------------------------------------------------------
+-- Checkpointing
+------------------------------------------------------------------
 
--- ── Display helpers ───────────────────────────────────────────
-local function cls()
-  if gpu then
-    gpu.setBackground(BG)
-    gpu.setForeground(C.value)
-    gpu.fill(1, 1, W, H, " ")
+local function saveCheckpoint()
+  if not (state.A and state.B) then return end
+  local ok = common.saveTable(CHECKPOINT_PATH, {
+    seriesId = state.seriesId,
+    n = state.n,
+    limbsPerChunk = state.limbsPerChunk,
+    stepsCompleted = state.stepsCompleted,
+    A = state.A,
+    B = state.B,
+    savedAt = os.time(),
+  })
+  state.lastCheckpointTime = computer.uptime()
+  if ok then
+    log("Checkpoint saved (step " .. state.stepsCompleted .. ", n=" .. state.n .. ").", ui.palette.dim)
   else
-    term.clear()
+    log("Checkpoint save FAILED.", ui.palette.bad)
   end
-end
-
-local function put(x, y, text, fg, bg)
-  if not gpu or y < 1 or y > H or x > W then return end
-  gpu.setBackground(bg or BG)
-  gpu.setForeground(fg or C.value)
-  local s = tostring(text or "")
-  if x < 1 then s = s:sub(2 - x); x = 1 end
-  if x + #s - 1 > W then s = s:sub(1, W - x + 1) end
-  if #s > 0 then gpu.set(x, y, s) end
-end
-
-local function hline(y, fg)
-  put(1, y, "+" .. ("-"):rep(W - 2) .. "+", fg or C.border)
-end
-
-local function pad(s, w)
-  s = tostring(s or "")
-  if #s > w then return s:sub(1, w) end
-  return s .. (" "):rep(w - #s)
-end
-
-local function trunc(s, max)
-  s = tostring(s or "")
-  if #s <= max then return s end
-  local h = math.floor((max - 3) / 2)
-  return s:sub(1, h) .. "..." .. s:sub(-(max - h - 3))
-end
-
-local function drawBar(x, y, barW, free, total)
-  local pct = (total > 0) and (1 - free / total) or 0
-  local filled = math.max(0, math.min(barW, math.floor(pct * barW)))
-  local col = (pct < 0.5) and C.good or (pct < 0.8) and C.warn or C.bad
-  put(x,              y, "[",                      C.border)
-  put(x + 1,          y, ("#"):rep(filled),        col)
-  put(x + 1 + filled, y, ("."):rep(barW - filled), C.dim)
-  put(x + 1 + barW,   y, "]",                      C.border)
-  put(x + barW + 2,    y, string.format("%3d%%", math.floor(pct * 100)), col)
-end
-
--- ── Packed arbitrary precision arithmetic ─────────────────────
-local LIMB_BASE  = 10000000   -- 10^7
-local LIMB_WIDTH = 7
-local CHUNK_LIMBS = 64
-
-local function trimLimbs(a)
-  local i = #a
-  while i > 1 and (a[i] or 0) == 0 do
-    a[i] = nil
-    i = i - 1
-  end
-  return a
-end
-
-local function fromDecimal(s)
-  s = tostring(s or "0"):gsub("^0+", "")
-  if s == "" then return {0} end
-  local limbs = {}
-  while #s > 0 do
-    local start = math.max(1, #s - LIMB_WIDTH + 1)
-    limbs[#limbs + 1] = tonumber(s:sub(start)) or 0
-    s = s:sub(1, start - 1)
-  end
-  return limbs
-end
-
-local function toDecimal(a)
-  local i = #a
-  while i > 1 and (a[i] or 0) == 0 do i = i - 1 end
-  local parts = { tostring(a[i] or 0) }
-  for j = i - 1, 1, -1 do
-    parts[#parts + 1] = string.format("%07d", a[j] or 0)
-  end
-  return table.concat(parts)
-end
-
-local function decimalDigits(a)
-  local i = #a
-  while i > 1 and (a[i] or 0) == 0 do i = i - 1 end
-  local hi = tostring(a[i] or 0)
-  return (#a - 1) * LIMB_WIDTH + #hi
-end
-
-local function bigadd(a, b)
-  local result = {}
-  local carry  = 0
-  local na, nb = #a, #b
-  local n = na > nb and na or nb
-  for i = 1, n do
-    local sum = (a[i] or 0) + (b[i] or 0) + carry
-    if sum >= LIMB_BASE then
-      result[i] = sum - LIMB_BASE
-      carry = 1
-    else
-      result[i] = sum
-      carry = 0
-    end
-  end
-  if carry > 0 then
-    result[n + 1] = carry   -- at most one extra limb
-  end
-  return result
-end
-
-local function splitChunks(limbs)
-  local chunks, total = {}, math.max(1, math.ceil(#limbs / CHUNK_LIMBS))
-  for part = 1, total do
-    local chunk = {}
-    local start = (part - 1) * CHUNK_LIMBS + 1
-    local stop = math.min(#limbs, start + CHUNK_LIMBS - 1)
-    for i = start, stop do
-      chunk[#chunk + 1] = limbs[i]
-    end
-    chunks[part] = chunk
-  end
-  return chunks, total
-end
-
-local function encodeChunk(chunk)
-  local out = {}
-  for i = 1, #chunk do out[i] = tostring(chunk[i] or 0) end
-  return table.concat(out, ",")
-end
-
--- OPTIMISED: only convert the leading limbs needed to fill maxLen
--- characters, rather than calling toDecimal() on the full number.
-local function fastPreview(a, maxLen)
-  local i = #a
-  while i > 1 and (a[i] or 0) == 0 do i = i - 1 end
-  -- If the number is small enough, convert in full.
-  if i * LIMB_WIDTH <= maxLen + LIMB_WIDTH then
-    return toDecimal(a)
-  end
-  -- Otherwise only pull the top few limbs (enough to fill maxLen).
-  local needed = math.ceil(maxLen / LIMB_WIDTH) + 2
-  local parts  = { tostring(a[i] or 0) }
-  local j = i - 1
-  local count = 0
-  while j >= 1 and count < needed do
-    parts[#parts + 1] = string.format("%07d", a[j] or 0)
-    j = j - 1
-    count = count + 1
-  end
-  local s = table.concat(parts)
-  if #s > maxLen then
-    return s:sub(1, maxLen) .. "~"   -- ~ indicates truncation
-  end
-
-  return s
-end
-
-local function bigmul(a, b)
-  if (#a == 1 and (a[1] or 0) == 0) or (#b == 1 and (b[1] or 0) == 0) then
-    return { 0 }
-  end
-
-  local result = {}
-  for i = 1, #a do
-    local ai = a[i] or 0
-    if ai ~= 0 then
-      local carry = 0
-      for j = 1, #b do
-        local idx = i + j - 1
-        local sum = (result[idx] or 0) + ai * (b[j] or 0) + carry
-        carry = math.floor(sum / LIMB_BASE)
-        result[idx] = sum - carry * LIMB_BASE
-      end
-      local k = i + #b
-      while carry > 0 do
-        local sum = (result[k] or 0) + carry
-        carry = math.floor(sum / LIMB_BASE)
-        result[k] = sum - carry * LIMB_BASE
-        k = k + 1
-      end
-    end
-  end
-  return trimLimbs(result)
-end
-
-local function matrixMul(a, b)
-  return {
-    {
-      bigadd(bigmul(a[1][1], b[1][1]), bigmul(a[1][2], b[2][1])),
-      bigadd(bigmul(a[1][1], b[1][2]), bigmul(a[1][2], b[2][2])),
-    },
-    {
-      bigadd(bigmul(a[2][1], b[1][1]), bigmul(a[2][2], b[2][1])),
-      bigadd(bigmul(a[2][1], b[1][2]), bigmul(a[2][2], b[2][2])),
-    },
-  }
-end
-
-local function bootstrapFibPair(n)
-  if n <= 0 then return { 0 }, { 1 } end
-  local result = {
-    { { 1 }, { 0 } },
-    { { 0 }, { 1 } },
-  }
-  local base = {
-    { { 1 }, { 1 } },
-    { { 1 }, { 0 } },
-  }
-  local exp = n
-  while exp > 0 do
-    if exp % 2 == 1 then
-      result = matrixMul(result, base)
-    end
-    exp = math.floor(exp / 2)
-    if exp > 0 then
-      base = matrixMul(base, base)
-    end
-  end
-  return result[1][2], result[1][1]
-end
-
-local function addChunkWithCarry(a, b, carryIn)
-  local result = {}
-  local carry = carryIn or 0
-  local n = math.max(#a, #b)
-  for i = 1, n do
-    local sum = (a[i] or 0) + (b[i] or 0) + carry
-    if sum >= LIMB_BASE then
-      result[i] = sum - LIMB_BASE
-      carry = 1
-    else
-      result[i] = sum
-      carry = 0
-    end
-  end
-  return result, carry
-end
-
-local function addChunkVariants(a, b)
-  local sum0, carry0 = addChunkWithCarry(a, b, 0)
-  local sum1, carry1 = addChunkWithCarry(a, b, 1)
-  return sum0, carry0, sum1, carry1
-end
-
--- ── Constants ─────────────────────────────────────────────────
-local DISCOVERY_TIME      = 2.5
-local STAT_INTERVAL       = 2.0
-local DRAW_INTERVAL       = 0.25
-local YIELD_EVERY         = 200      -- was 50; amortises overhead better
-local CHECKPOINT_INTERVAL = 30.0
-local CHECKPOINT_FILE     = "/fib_checkpoint.dat"
-local CHECKPOINT_TMP      = "/fib_checkpoint.tmp"
-
--- ── Checkpoint I/O ────────────────────────────────────────────
-local function saveCheckpoint(n, prev, curr)
-  local f, err = io.open(CHECKPOINT_TMP, "w")
-  if not f then return false, "open failed: " .. tostring(err) end
-  f:write(tostring(n) .. "\n" .. toDecimal(prev) .. "\n" .. toDecimal(curr) .. "\n")
-  f:close()
-  if fs.exists(CHECKPOINT_FILE) then fs.remove(CHECKPOINT_FILE) end
-  local ok = fs.rename(CHECKPOINT_TMP, CHECKPOINT_FILE)
-  if not ok then return false, "rename failed" end
-  return true
 end
 
 local function loadCheckpoint()
-  local path = fs.exists(CHECKPOINT_FILE) and CHECKPOINT_FILE
-            or fs.exists(CHECKPOINT_TMP)  and CHECKPOINT_TMP
-            or nil
-  if not path then return nil end
-  local f = io.open(path, "r")
-  if not f then return nil end
-  local ns, ps, cs = f:read("*l"), f:read("*l"), f:read("*l")
-  f:close()
-  local n = tonumber(ns)
-  if not n or not ps or not cs then return nil end
-  if not ps:match("^%d+$") or not cs:match("^%d+$") then return nil end
-  return n, ps, cs
+  return common.loadTable(CHECKPOINT_PATH)
 end
 
--- ── Node registry ────────────────────────────────────────────
-local nodes       = {}   -- storage nodes
-local nodeList    = {}
-local computeNodes = {}
-local computeList  = {}
-local computeRobin = 0
+------------------------------------------------------------------
+-- Drawing
+------------------------------------------------------------------
 
-local function sortedNodeList()
-  local list = {}
-  for i = 1, #nodeList do list[i] = nodeList[i] end
-  table.sort(list, function(a, b)
-    local na, nb = nodes[a], nodes[b]
-    local fa = na and na.free or 0
-    local fb = nb and nb.free or 0
-    return fa > fb
-  end)
-  return list
-end
-
-local function sortedComputeList()
-  local list = {}
-  for i = 1, #computeList do list[i] = computeList[i] end
-  table.sort(list, function(a, b)
-    local na, nb = computeNodes[a], computeNodes[b]
-    local fa = na and na.free or 0
-    local fb = nb and nb.free or 0
-    return fa > fb
-  end)
-  return list
-end
-
-local function chooseNodeForBytes(bytes)
-  local sorted = sortedNodeList()
-  for _, addr in ipairs(sorted) do
-    local nd = nodes[addr]
-    if nd and (nd.free or 0) >= bytes then
-      return addr
+local function drawNetwork()
+  local x, y, w = 3, 3, math.floor(W/2) - 3
+  ui.clearArea(x, y, w, netBoxH - 2)
+  local line = y
+  ui.text(x, line, string.format("My address: %s", util.shortId(myId)), ui.palette.dim); line = line + 1
+  local comp, stor = computeNodes(), storageNodes()
+  ui.text(x, line, string.format("Compute nodes: %d    Storage nodes: %d", #comp, #stor), ui.palette.text)
+  line = line + 2
+  local shown = 0
+  local maxShow = netBoxH - (line - y) - 1
+  for _, addr in ipairs(comp) do
+    if shown >= maxShow then break end
+    local n2 = nodes[addr]
+    if n2 then
+      local busyTxt = n2.busy and "BUSY" or "idle"
+      local color = n2.busy and ui.palette.accent2 or ui.palette.good
+      ui.text(x, line, string.format("  %-10s %-6s %s", n2.name, busyTxt, util.shortId(addr)), color)
+      line = line + 1; shown = shown + 1
     end
   end
-  return sorted[1]
-end
-
-local function chooseComputeNode()
-  local sorted = sortedComputeList()
-  if #sorted == 0 then
-    return nil
-  end
-  computeRobin = (computeRobin % #sorted) + 1
-  return sorted[computeRobin]
-end
-
-local function waitForReply(addr, expectCmd, timeout)
-  local deadline = computer.uptime() + (timeout or 1.5)
-  while computer.uptime() < deadline do
-    local ev, _, sender, port, _, cmd, a1, a2, a3, a4, a5, a6 =
-      event.pull(deadline - computer.uptime(), "modem_message")
-    if ev and sender == addr and port == PORT and cmd == expectCmd then
-      return a1, a2, a3, a4, a5, a6
+  for _, addr in ipairs(stor) do
+    if shown >= maxShow then break end
+    local n2 = nodes[addr]
+    if n2 then
+      ui.text(x, line, string.format("  %-10s %s", n2.name, util.shortId(addr)), ui.palette.accent)
+      line = line + 1; shown = shown + 1
     end
   end
-  return nil, "timeout"
 end
 
-local function storeChunk(addr, idx, part, total, payload)
-  modem.send(addr, PORT, "STORE", tostring(idx), tostring(part), tostring(total), payload)
-  local a1, a2 = waitForReply(addr, "ACK", 1.8)
-  if tonumber(a1) == idx and tonumber(a2) == part then
-    return true
-  end
-  return nil, tostring(a1 or "no ack")
-end
-
-local function purgeChunk(addr, idx, part)
-  modem.send(addr, PORT, "PURGE", tostring(idx), tostring(part))
-end
-
-local storedManifests = {} -- [idx] = { total = n, parts = { [part] = addr } }
-
-local function storeNumber(idx, limbs)
-  if #nodeList == 0 then
-    return true
-  end
-
-  local chunks, total = splitChunks(limbs)
-  storedManifests[idx] = storedManifests[idx] or { total = total, parts = {} }
-  storedManifests[idx].total = total
-  storedManifests[idx].parts = storedManifests[idx].parts or {}
-
-  for part = 1, total do
-    local payload = encodeChunk(chunks[part])
-    local addr = chooseNodeForBytes(#payload + 32)
-    if not addr then
-      return nil, "no storage nodes available"
+local function drawProgress()
+  local x, y = math.floor(W/2) + 3, 3
+  local w = W - x - 1
+  ui.clearArea(x, y, w, netBoxH - 2)
+  local line = y
+  local phaseColor = ui.palette.warn
+  if state.phase == "GROWING" then phaseColor = ui.palette.good end
+  if state.phase == "SEEDING_STORAGE" or state.phase == "BOOTSTRAP" then phaseColor = ui.palette.accent2 end
+  ui.text(x, line, "Phase: " .. state.phase .. (state.paused and " (PAUSED)" or ""), phaseColor); line = line + 1
+  ui.text(x, line, "Series: " .. (state.seriesId or "-"), ui.palette.dim); line = line + 2
+  if state.n > 0 then
+    ui.text(x, line, "Index n = F(" .. util.commas(state.n) .. ")", ui.palette.text); line = line + 1
+    if state.lastDigits then
+      ui.text(x, line, "Digits ~= " .. util.commas(state.lastDigits), ui.palette.text); line = line + 1
     end
-
-    local ok, err = storeChunk(addr, idx, part, total, payload)
-    if not ok then
-      local placed = false
-      for _, alt in ipairs(sortedNodeList()) do
-        if alt ~= addr then
-          ok, err = storeChunk(alt, idx, part, total, payload)
-          if ok then
-            addr = alt
-            placed = true
-            break
-          end
-        end
-      end
-      if not placed then
-        return nil, err
-      end
+    if state.B then
+      ui.text(x, line, "Chunks: " .. state.B.chunkCount .. " x " .. state.limbsPerChunk .. " limbs", ui.palette.dim); line = line + 1
     end
-
-    storedManifests[idx].parts[part] = addr
-    if nodes[addr] then
-      nodes[addr].free = math.max(0, (nodes[addr].free or 0) - #payload)
-      nodes[addr].stored = (nodes[addr].stored or 0) + 1
+    ui.text(x, line, "Steps completed: " .. util.commas(state.stepsCompleted), ui.palette.text); line = line + 1
+    local elapsed = computer.uptime() - state.startTime
+    ui.text(x, line, "Elapsed: " .. util.formatDuration(elapsed), ui.palette.dim); line = line + 1
+    if #state.lastStepDurations > 0 then
+      local sum = 0
+      for _, d in ipairs(state.lastStepDurations) do sum = sum + d end
+      local avg = sum / #state.lastStepDurations
+      ui.text(x, line, string.format("Avg step time: %.1fs", avg), ui.palette.dim); line = line + 1
     end
   end
-
-  return true
 end
 
-local function purgeNumber(idx)
-  local man = storedManifests[idx]
-  if not man then return end
-  for part, addr in pairs(man.parts or {}) do
-    purgeChunk(addr, idx, part)
-  end
-  storedManifests[idx] = nil
+local function drawFooter()
+  ui.footer("q=quit  p=pause/resume  c=checkpoint now   |   free mem: " .. util.formatBytes(computer.freeMemory()))
 end
 
-local function decodeChunk(payload)
-  payload = tostring(payload or "")
-  if payload == "" then return { 0 } end
-  local chunk = {}
-  for token in payload:gmatch("[^,]+") do
-    chunk[#chunk + 1] = tonumber(token) or 0
-  end
-  if #chunk == 0 then chunk[1] = 0 end
-  return chunk
+drawNetwork(); drawProgress(); drawFooter()
+
+------------------------------------------------------------------
+-- Message handling (registration / heartbeats / bye) - used in
+-- every phase.
+------------------------------------------------------------------
+
+local function welcomeNode(addr, name)
+  net.send(modems, addr, {
+    type = "welcome", to = addr, name = name,
+    seriesId = state.seriesId, resume = (state.stepsCompleted > 0),
+  })
 end
 
-local function fetchChunk(addr, idx, part, deleteAfter)
-  if not addr then return nil, "no address" end
-  modem.send(addr, PORT, "FETCH", tostring(idx), tostring(part), deleteAfter and "1" or "0")
-  local a1, a2, a3, a4 = waitForReply(addr, "GOT", 2.0)
-  if tonumber(a1) ~= idx or tonumber(a2) ~= part then
-    return nil, "bad reply"
-  end
-  return decodeChunk(a4), tonumber(a3) or 0
-end
+-- forward-declared; set once we know how to requeue a task (defined
+-- later, near the growth-loop task queue)
+local requeueTaskForWorker
 
-local function loadNumber(idx, deleteAfter)
-  local man = storedManifests[idx]
-  if not man then
-    return nil, "missing manifest"
-  end
+local function handleRegistryMessage(msg, remoteAddr)
+  if msg.type == "hello_compute" then
+    local n2, isNew = registerNode(remoteAddr, "compute", { memFree = msg.memFree, memTotal = msg.memTotal })
+    welcomeNode(remoteAddr, n2.name)
+    if isNew then log(n2.name .. " joined (compute, " .. util.formatBytes(msg.memFree or 0) .. " free).", ui.palette.good) end
+    drawNetwork()
 
-  local total = tonumber(man.total) or 0
-  if total <= 0 then
-    for part in pairs(man.parts or {}) do
-      if part > total then total = part end
-    end
-  end
-  if total <= 0 then
-    return { 0 }
-  end
+  elseif msg.type == "hello_storage" then
+    local n2, isNew = registerNode(remoteAddr, "storage", { disks = msg.disks, inventoryCount = msg.inventoryCount })
+    welcomeNode(remoteAddr, n2.name)
+    if isNew then log(n2.name .. " joined (storage, " .. (msg.inventoryCount or 0) .. " existing chunk files seen).", ui.palette.good) end
+    drawNetwork()
 
-  local limbs = {}
-  for part = 1, total do
-    local addr = man.parts and man.parts[part]
-    local chunk, err = fetchChunk(addr, idx, part, deleteAfter)
-    if not chunk then
-      local found = false
-      for _, alt in ipairs(nodeList) do
-        if alt ~= addr then
-          chunk, err = fetchChunk(alt, idx, part, deleteAfter)
-          if chunk then
-            addr = alt
-            found = true
-            break
-          end
-        end
-      end
-      if not found then
-        return nil, err or ("missing part " .. tostring(part))
-      end
-    end
-    for i = 1, #chunk do
-      limbs[#limbs + 1] = chunk[i]
-    end
-    if man.parts then man.parts[part] = addr end
-  end
-
-
-  return trimLimbs(limbs)
-end
-
--- ── Discovery phase ───────────────────────────────────────────
-local function cprint(text, fg)
-  if gpu then gpu.setForeground(fg or C.value); gpu.setBackground(BG) end
-  print(tostring(text))
-end
-
-cls()
-cprint("+" .. ("-"):rep(W - 2) .. "+", C.border)
-cprint("|" .. pad("  FIBONACCI MASTER NODE  [" .. modem.address:sub(1, 8)
-       .. "...]  --  discovery", W - 2) .. "|", C.header)
-cprint("+" .. ("-"):rep(W - 2) .. "+", C.border)
-cprint("|" .. pad("", W - 2) .. "|", C.dim)
-cprint("|" .. pad("  Scanning port " .. PORT .. " for storage and compute nodes ...", W - 2) .. "|", C.label)
-
-modem.broadcast(PORT, "PING")
-local deadline = computer.uptime() + DISCOVERY_TIME
-while computer.uptime() < deadline do
-  local ev, _, sender, port, _, cmd, free, total, cnt, kind =
-    event.pull(deadline - computer.uptime(), "modem_message")
-  if ev and port == PORT and cmd == "PONG" then
-    kind = tostring(kind or "storage")
-    if kind == "compute" then
-      if not computeNodes[sender] then computeList[#computeList + 1] = sender end
-      computeNodes[sender] = {
-        free    = tonumber(free)  or 0,
-        total   = tonumber(total) or 0,
-        stored  = tonumber(cnt)   or 0,
-        shortId = sender:sub(1, 8),
-      }
-      cprint("|" .. pad(string.format(
-        "  [C] %.8s...  compute ready   %.0f KiB free",
-        sender, (tonumber(free) or 0) / 1024), W - 2) .. "|", C.good)
+  elseif msg.type == "heartbeat" then
+    if nodes[remoteAddr] then
+      nodes[remoteAddr].lastSeen = computer.uptime()
+      nodes[remoteAddr].stats = msg.stats or nodes[remoteAddr].stats
     else
-      if not nodes[sender] then nodeList[#nodeList + 1] = sender end
-      nodes[sender] = {
-        free    = tonumber(free)  or 0,
-        total   = tonumber(total) or 0,
-        stored  = tonumber(cnt)   or 0,
-        shortId = sender:sub(1, 8),
-      }
-      cprint("|" .. pad(string.format(
-        "  [+] %.8s...  found   %.0f KiB free",
-        sender, (tonumber(free) or 0) / 1024), W - 2) .. "|", C.good)
+      -- missed the original hello; re-register from the heartbeat
+      local n2 = registerNode(remoteAddr, msg.role or "compute", msg.stats)
+      welcomeNode(remoteAddr, n2.name)
+      drawNetwork()
     end
-  end
-end
 
-cprint("|" .. pad("", W - 2) .. "|", C.dim)
-cprint("|" .. pad(string.format("  [*] %d storage node(s) ready.", #nodeList), W - 2) .. "|", C.good)
-cprint("|" .. pad(string.format("  [*] %d compute node(s) ready.", #computeList), W - 2) .. "|", C.good)
-cprint("|" .. pad("", W - 2) .. "|", C.dim)
-
--- ── Checkpoint resume prompt ──────────────────────────────────
-local prev, curr, n
-local resumedFrom = nil
-local cpN, cpPrev, cpCurr = loadCheckpoint()
-
-if cpN then
-  cprint("|" .. pad(string.format(
-    "  [C] Checkpoint found: fib(%d)  (%d digits)", cpN, #cpCurr), W - 2) .. "|", C.ckpt_ok)
-  cprint("|" .. pad("", W - 2) .. "|", C.dim)
-  if gpu then gpu.setForeground(C.value); gpu.setBackground(BG) end
-  io.write("|  Resume from checkpoint? [Y/n]  ")
-  local answer = (io.read() or ""):lower()
-  if answer ~= "n" then
-    n = cpN
-    prev = fromDecimal(cpPrev)
-    curr = fromDecimal(cpCurr)
-    resumedFrom = cpN
-    cprint("|" .. pad(string.format("  Resuming from fib(%d).", n), W - 2) .. "|", C.good)
-  else
-    cprint("|" .. pad("  Starting fresh from fib(0).", W - 2) .. "|", C.label)
-  end
-else
-  cprint("|" .. pad("  No checkpoint -- starting from fib(0).", W - 2) .. "|", C.label)
-end
-
-if not n then
-  if BOOTSTRAP_FIB and BOOTSTRAP_FIB > 1 then
-    cprint("|" .. pad(string.format(
-      "  [*] Bootstrapping with matrix exponentiation to fib(%d)...",
-      BOOTSTRAP_FIB), W - 2) .. "|", C.label)
-    local bootStart = computer.uptime()
-    local bootN = math.max(1, BOOTSTRAP_FIB)
-    prev, curr = bootstrapFibPair(bootN - 1)
-    n = bootN
-    cprint("|" .. pad(string.format(
-      "  [*] Bootstrap complete in %.1f s.", computer.uptime() - bootStart),
-      W - 2) .. "|", C.good)
-  else
-    prev = { 0 }
-    curr = { 1 }
-    n = 1
-  end
-end
-
-cprint("|" .. pad("", W - 2) .. "|", C.dim)
-cprint("|" .. pad("  Starting in 1 s ...", W - 2) .. "|", C.dim)
-cprint("+" .. ("-"):rep(W - 2) .. "+", C.border)
-os.sleep(1)
-
--- ── Stat helpers ──────────────────────────────────────────────
-local lastStat = 0
-local function pollStats()
-  for _, addr in ipairs(nodeList) do modem.send(addr, PORT, "STAT") end
-  for _, addr in ipairs(computeList) do modem.send(addr, PORT, "STAT") end
-end
-
-local function drainStats()
-  while true do
-    local ev, _, sender, port, _, cmd, free, total, cnt =
-      event.pull(0, "modem_message")
-    if not ev then break end
-    if port == PORT and cmd == "STAT" then
-      if nodes[sender] then
-        nodes[sender].free   = tonumber(free)  or nodes[sender].free
-        nodes[sender].total  = tonumber(total) or nodes[sender].total
-        nodes[sender].stored = tonumber(cnt)   or nodes[sender].stored
-      elseif computeNodes[sender] then
-        computeNodes[sender].free   = tonumber(free)  or computeNodes[sender].free
-        computeNodes[sender].total  = tonumber(total) or computeNodes[sender].total
-        computeNodes[sender].stored = tonumber(cnt)   or computeNodes[sender].stored
+  elseif msg.type == "bye" then
+    if nodes[remoteAddr] then
+      local name = nodes[remoteAddr].name
+      if nodes[remoteAddr].role == "compute" and nodes[remoteAddr].busy and requeueTaskForWorker then
+        requeueTaskForWorker(remoteAddr)
       end
+      dropNode(remoteAddr)
+      log(name .. " left the network.", ui.palette.warn)
+      drawNetwork()
     end
   end
 end
 
--- ── Queue and transfer helpers ────────────────────────────────
-local lastCkptStatus = "none yet"
-local lastCkptColor  = C.dim
-local lastCkptTime   = 0
-local sendQueue  = {}
-local queueDrops = 0
+local function sweepDeadNodes()
+  local now = computer.uptime()
+  for addr, n2 in pairs(nodes) do
+    if now - n2.lastSeen > common.HEARTBEAT_TIMEOUT then
+      local name = n2.name
+      if n2.role == "compute" and n2.busy and requeueTaskForWorker then
+        requeueTaskForWorker(addr)
+      end
+      dropNode(addr)
+      log(name .. " timed out and was dropped.", ui.palette.warn)
+      drawNetwork()
+    end
+  end
+end
 
-local function flushQueue()
-  if #nodeList == 0 then
-    queueDrops = queueDrops + #sendQueue
-    sendQueue = {}
+------------------------------------------------------------------
+-- Phase: bootstrap
+------------------------------------------------------------------
+
+local function runBootstrap()
+  state.phase = "BOOTSTRAP"
+  drawProgress()
+  log("Starting bootstrap: searching for the largest Fibonacci number", ui.palette.accent2)
+  log("that fits in half of this machine's memory (fast doubling)...", ui.palette.accent2)
+  local n, a, b = common.bootstrapFindMaxFib(function(s) log(s, ui.palette.dim) end)
+  state.n = n + 1 -- B represents F(n+1)
+  state.seriesId = util.newSeriesId()
+  log(string.format("Bootstrap complete: F(%d) and F(%d), %d digits.", n, n + 1, bigint.digitCount(b)), ui.palette.good)
+  return a, b -- a = F(n), b = F(n+1)
+end
+
+------------------------------------------------------------------
+-- Phase: seed storage (convert in-memory bigints to chunk manifests)
+------------------------------------------------------------------
+
+local function seedNumberToStorage(x, label)
+  local chunks, count = bigint.toChunks(x, state.limbsPerChunk)
+  local manifest = {}
+  for i = 1, count do
+    local node = pickStorageNode()
+    if not node then error("no storage nodes available while seeding") end
+    local filename = string.format("%s_%s_%d.chunk", state.seriesId, label, i)
+    local ok, err = masterStoreChunk(node, filename, chunks[i])
+    if not ok then error("failed to seed chunk " .. i .. " of " .. label .. ": " .. tostring(err)) end
+    manifest[i] = { node = node, path = filename }
+    if i % 5 == 0 or i == count then
+      log(string.format("Seeding %s: %d/%d chunks stored...", label, i, count), ui.palette.dim)
+    end
+  end
+  return { chunkCount = count, manifest = manifest }
+end
+
+local function runSeeding(a, b)
+  state.phase = "SEEDING_STORAGE"
+  drawProgress()
+  log("Splitting bootstrap numbers into " .. state.limbsPerChunk .. "-limb chunks and", ui.palette.accent2)
+  log("distributing them across connected storage nodes...", ui.palette.accent2)
+  state.A = seedNumberToStorage(a, "A")
+  state.B = seedNumberToStorage(b, "B")
+  log("Seeding complete. Master's own memory is now free of the number.", ui.palette.good)
+  saveCheckpoint()
+end
+
+------------------------------------------------------------------
+-- Growth loop (task-queue state machine, ticked from the main loop)
+------------------------------------------------------------------
+
+local growth = nil -- current in-progress step, or nil if none active
+
+local function beginStep()
+  local chunkCount = math.max(state.A.chunkCount, state.B.chunkCount)
+  local pending = {}
+  for i = 1, chunkCount do
+    local aRef = state.A.manifest[i]
+    local bRef = state.B.manifest[i]
+    for carryIn = 0, 1 do
+      local storageNode = pickStorageNode()
+      local filename = string.format("%s_R%d_s%d_c%d.chunk", state.seriesId, carryIn, state.stepsCompleted + 1, i)
+      pending[#pending+1] = {
+        taskId = myId .. "-t" .. state.stepsCompleted .. "-" .. i .. "-" .. carryIn,
+        chunkIndex = i, carryIn = carryIn,
+        aRef = aRef, bRef = bRef,
+        limbsPerChunk = state.limbsPerChunk,
+        resultRef = { node = storageNode, path = filename },
+        retries = 0,
+      }
+    end
+  end
+  growth = {
+    chunkCount = chunkCount,
+    pending = pending,      -- queue of tasks not yet dispatched
+    inFlight = {},          -- taskId -> {task=, worker=, sentAt=}
+    results = {},           -- [chunkIndex] = {c0={carryOut=,resultRef=}, c1={...}}
+    resolvedCount = 0,
+    total = #pending,
+    startedAt = computer.uptime(),
+  }
+end
+
+requeueTaskForWorker = function(workerAddr)
+  if not growth then return end
+  for taskId, entry in pairs(growth.inFlight) do
+    if entry.worker == workerAddr then
+      entry.task.retries = entry.task.retries + 1
+      growth.pending[#growth.pending+1] = entry.task
+      growth.inFlight[taskId] = nil
+      log(string.format("Requeued chunk %d (carryIn=%d) after worker loss (retry #%d).",
+        entry.task.chunkIndex, entry.task.carryIn, entry.task.retries), ui.palette.warn)
+    end
+  end
+end
+
+local function dispatchPending()
+  if not growth then return end
+  while #growth.pending > 0 do
+    local worker = pickIdleComputeNode()
+    if not worker then break end
+    local task = table.remove(growth.pending, 1)
+    nodes[worker].busy = true
+    growth.inFlight[task.taskId] = { task = task, worker = worker, sentAt = computer.uptime() }
+    net.send(modems, worker, {
+      type = "task_chunk_add", taskId = task.taskId,
+      chunkIndex = task.chunkIndex, carryIn = task.carryIn,
+      aRef = task.aRef, bRef = task.bRef, limbsPerChunk = task.limbsPerChunk,
+      resultRef = task.resultRef,
+    })
+  end
+end
+
+local function sweepTaskTimeouts()
+  if not growth then return end
+  local now = computer.uptime()
+  for taskId, entry in pairs(growth.inFlight) do
+    if now - entry.sentAt > common.TASK_TIMEOUT then
+      if nodes[entry.worker] then nodes[entry.worker].busy = false end
+      entry.task.retries = entry.task.retries + 1
+      growth.pending[#growth.pending+1] = entry.task
+      growth.inFlight[taskId] = nil
+      log(string.format("Chunk %d (carryIn=%d) timed out, retrying (#%d).",
+        entry.task.chunkIndex, entry.task.carryIn, entry.task.retries), ui.palette.warn)
+    end
+  end
+end
+
+local function handleTaskDone(msg, remoteAddr)
+  -- Whoever just replied is done working, full stop - free them up
+  -- immediately regardless of whether our task bookkeeping below still
+  -- considers this particular attempt current. Without this, a worker
+  -- whose task was reassigned after a timeout (but who was only slow,
+  -- not actually gone) could stay marked "busy" forever once its late
+  -- reply arrives after the reassigned attempt already resolved things.
+  if nodes[remoteAddr] then nodes[remoteAddr].busy = false end
+
+  if not growth then return end
+  local entry = growth.inFlight[msg.taskId]
+  if not entry then return end -- stale/duplicate reply for an already-resolved attempt
+  growth.inFlight[msg.taskId] = nil
+
+  if not msg.ok then
+    entry.task.retries = entry.task.retries + 1
+    growth.pending[#growth.pending+1] = entry.task
+    if entry.task.retries % 4 == 0 then
+      log(string.format("Chunk %d (carryIn=%d) still failing after %d retries: %s",
+        entry.task.chunkIndex, entry.task.carryIn, entry.task.retries, tostring(msg.err)), ui.palette.bad)
+    end
     return
   end
 
-  for _, item in ipairs(sendQueue) do
-    local idx, limbs = item[1], item[2]
-    local ok, err = storeNumber(idx, limbs)
-    if not ok then
-      queueDrops = queueDrops + 1
-      lastCkptStatus = "STORE failed: " .. tostring(err)
-      lastCkptColor = C.bad
-    else
-      if idx >= 3 then
-        purgeNumber(idx - 2)
-      end
-    end
-  end
-  sendQueue = {}
+  local rec = growth.results[msg.chunkIndex] or {}
+  if msg.carryIn == 0 then rec.c0 = { carryOut = msg.carryOut, resultRef = entry.task.resultRef } end
+  if msg.carryIn == 1 then rec.c1 = { carryOut = msg.carryOut, resultRef = entry.task.resultRef } end
+  growth.results[msg.chunkIndex] = rec
+  growth.resolvedCount = growth.resolvedCount + 1
 end
 
--- ── Layout ────────────────────────────────────────────────────
-local MID = math.floor(W / 2)
-local BAR_W_L = math.max(4, W - 21)
-local BAR_W_N = math.max(4, W - 43)
-lastCkptStatus = resumedFrom and string.format("resumed from fib(%d)", resumedFrom) or "none yet"
-lastCkptColor  = resumedFrom and C.ckpt_ok or C.dim
-lastCkptTime   = 0
-
-local function drawFrame()
-  cls()
-
-  hline(1)
-  put(1, 2, "|", C.border)
-  put(2, 2, pad("  FIBONACCI MASTER NODE  [" .. modem.address:sub(1, 8) .. "...]", W - 2), C.header)
-  put(W, 2, "|", C.border)
-  hline(3)
-
-  for row = 4, 6 do
-    put(1, row, "|", C.border)
-    put(MID, row, "|", C.border)
-    put(W, row, "|", C.border)
-  end
-  hline(7)
-
-  put(1, 8, "|", C.border); put(W, 8, "|", C.border)
-  hline(9)
-
-  put(1, 10, "|", C.border); put(W, 10, "|", C.border)
-  put(1, 11, "|", C.border); put(W, 11, "|", C.border)
-  hline(12)
-
-  put(1, 13, "|", C.border)
-  put(2, 13, pad("  STORAGE NODES", W - 2), C.header)
-  put(W, 13, "|", C.border)
-  hline(14)
-
-  if #nodeList == 0 then
-    put(1, 15, "|", C.border)
-    put(2, 15, pad("  (no nodes -- running in compute-only mode)", W - 2), C.dim)
-    put(W, 15, "|", C.border)
-    hline(16)
-  else
-    for i = 1, #nodeList do
-      local row = 14 + i
-      if row < H then
-        put(1, row, "|", C.border)
-        put(W, row, "|", C.border)
-      end
-    end
-    hline(math.min(H, 15 + #nodeList))
-  end
-end
-
-local function statRow(y, lLbl, lVal, lCol, rLbl, rVal, rCol)
-  put(2,        y, " " .. pad(lLbl, 8) .. " : ",      C.label)
-  put(13,       y, pad(tostring(lVal), MID - 14),      lCol or C.number)
-  put(MID + 1,  y, " " .. pad(rLbl, 8) .. " : ",      C.label)
-  put(MID + 12, y, pad(tostring(rVal), W - MID - 13), rCol or C.number)
-end
-
-local function drawStatus(nVal, digits, elapsed, rate, previewStr)
-  local lFree  = computer.freeMemory()
-  local lTotal = computer.totalMemory()
-
-  statRow(4,
-    "fib(n)", tostring(nVal), C.number,
-    "rate", string.format("%.1f /s", rate), rate > 0 and C.good or C.dim)
-  statRow(5,
-    "digits", tostring(digits), C.number,
-    "queue", string.format("%d buffered", #sendQueue), #sendQueue > 0 and C.warn or C.value)
-  statRow(6,
-    "elapsed", string.format("%.1f s", elapsed), C.value,
-    "nodes", string.format("%d storage / %d compute", #nodeList, #computeList),
-    (#nodeList + #computeList) > 0 and C.good or C.warn)
-
-  put(2,  8, " value  : ", C.label)
-  put(11, 8, pad(trunc(previewStr, W - 12), W - 12), C.preview)
-
-  put(2, 10, " local RAM  ", C.label)
-  drawBar(14, 10, BAR_W_L, lFree, lTotal)
-
-  put(2, 11, " checkpoint : ", C.label)
-  put(16, 11, pad(lastCkptStatus, W - 17), lastCkptColor)
-
-  for i, addr in ipairs(nodeList) do
-    local nd  = nodes[addr]
-    local row = 14 + i
-    if nd and row < H then
-      put(2, row, "[" .. nd.shortId .. "...]  ", C.node_id)
-      drawBar(17, row, BAR_W_N, nd.free, nd.total)
-      local eStr = string.format("entries: %d", nd.stored or 0)
-      put(W - #eStr - 1, row, eStr, C.value)
-    end
-  end
-end
-
-local function parallelBigAdd(a, b)
-  local width = math.max(#a, #b)
-  local total = math.max(1, math.ceil(width / CHUNK_LIMBS))
-  local jobId = tostring(computer.uptime()) .. "-" .. tostring(math.random(100000, 999999))
-  local replies = {}
-  local taskInputs = {}
-
-  local expected = 0
-  for part = 1, total do
-    local startIdx = (part - 1) * CHUNK_LIMBS + 1
-    local stopIdx  = math.min(width, startIdx + CHUNK_LIMBS - 1)
-    local chunkA, chunkB = {}, {}
-    for i = startIdx, stopIdx do
-      chunkA[#chunkA + 1] = a[i] or 0
-      chunkB[#chunkB + 1] = b[i] or 0
-    end
-    if #chunkA == 0 then chunkA[1] = 0 end
-    if #chunkB == 0 then chunkB[1] = 0 end
-
-    taskInputs[part] = { chunkA, chunkB }
-
-    local worker = chooseComputeNode()
-    if worker then
-      modem.send(worker, PORT, "ADDJOB", jobId, tostring(part), tostring(total),
-        encodeChunk(chunkA), encodeChunk(chunkB))
-      expected = expected + 1
-    else
-      local sum0, carry0, sum1, carry1 = addChunkVariants(chunkA, chunkB)
-      replies[part] = { sum0 = sum0, carry0 = carry0, sum1 = sum1, carry1 = carry1 }
-    end
-  end
-
-  local deadline = computer.uptime() + 10.0
-  while expected > 0 do
-    local timeout = math.max(0, deadline - computer.uptime())
-    local ev, _, sender, port, _, cmd, a1, a2, a3, a4, a5, a6 =
-      event.pull(timeout, "modem_message")
-    if not ev then
-      for part = 1, total do
-        if not replies[part] then
-          local pair = taskInputs[part]
-          local sum0, carry0, sum1, carry1 = addChunkVariants(pair[1], pair[2])
-          replies[part] = { sum0 = sum0, carry0 = carry0, sum1 = sum1, carry1 = carry1 }
-        end
-      end
-      expected = 0
-    elseif port == PORT and cmd == "ADDRES" and a1 == jobId then
-      local part = tonumber(a2)
-      if part and not replies[part] then
-        replies[part] = {
-          sum0 = decodeChunk(a3), carry0 = tonumber(a4) or 0,
-          sum1 = decodeChunk(a5), carry1 = tonumber(a6) or 0,
-        }
-        expected = expected - 1
-      end
-    end
-  end
-
-  local result = {}
+-- Sequentially resolves the real carry chain using only the tiny
+-- carry BITS already collected (never touches chunk data), deletes
+-- the losing tentative chunk of each pair, and returns the new B.
+local function finalizeStep()
+  local newManifest = {}
   local carry = 0
-  for part = 1, total do
-    local rec = replies[part]
-    if not rec then
-      rec = { sum0 = { 0 }, carry0 = 0, sum1 = { 0 }, carry1 = 0 }
-    end
-
-    local chosen, nextCarry
-    if carry == 0 then
-      chosen, nextCarry = rec.sum0, rec.carry0
+  for i = 1, growth.chunkCount do
+    local rec = growth.results[i]
+    local chosen, loser
+    if carry == 0 then chosen, loser = rec.c0, rec.c1 else chosen, loser = rec.c1, rec.c0 end
+    newManifest[i] = chosen.resultRef
+    if loser then masterDeleteChunk(loser.resultRef.node, loser.resultRef.path) end
+    carry = chosen.carryOut
+  end
+  local newChunkCount = growth.chunkCount
+  if carry == 1 then
+    newChunkCount = newChunkCount + 1
+    local extra = bigint.zeroChunk(state.limbsPerChunk)
+    extra[1] = 1
+    local node = pickStorageNode()
+    local filename = string.format("%s_Rtop_s%d.chunk", state.seriesId, state.stepsCompleted + 1)
+    local ok = masterStoreChunk(node, filename, extra)
+    if ok then
+      newManifest[newChunkCount] = { node = node, path = filename }
     else
-      chosen, nextCarry = rec.sum1, rec.carry1
+      log("Failed to store carry-extension chunk - number may be truncated!", ui.palette.bad)
     end
-
-    modem.broadcast(PORT, "CHUNK", jobId, tostring(part), tostring(total),
-      tostring(carry), tostring(nextCarry), encodeChunk(chosen))
-
-    for i = 1, #chosen do
-      result[#result + 1] = chosen[i]
-    end
-    carry = nextCarry
   end
 
-  if carry > 0 then
-    result[#result + 1] = carry
+  -- old A is now fully superseded; free its chunks from storage
+  for i = 1, state.A.chunkCount do
+    local ref = state.A.manifest[i]
+    if ref then masterDeleteChunk(ref.node, ref.path) end
   end
 
-  return trimLimbs(result)
+  state.A = state.B
+  state.B = { chunkCount = newChunkCount, manifest = newManifest }
+  state.n = state.n + 1
+  state.stepsCompleted = state.stepsCompleted + 1
+
+  local dur = computer.uptime() - growth.startedAt
+  table.insert(state.lastStepDurations, dur)
+  while #state.lastStepDurations > 10 do table.remove(state.lastStepDurations, 1) end
+
+  -- Cheap exact digit count: only the (small) top chunk needs fetching.
+  local topRef = state.B.manifest[state.B.chunkCount]
+  if topRef then
+    local topChunk, err = masterFetchChunk(topRef.node, topRef.path)
+    if topChunk then
+      state.lastDigits = digitsFromTopChunk(topChunk, state.limbsPerChunk, state.B.chunkCount)
+    end
+  end
+
+  growth = nil
 end
 
--- ── Seed storage and run ──────────────────────────────────────
-if not resumedFrom and not (BOOTSTRAP_FIB and BOOTSTRAP_FIB > 1) then
-  table.insert(sendQueue, { 0, { 0 } })
-  table.insert(sendQueue, { 1, { 1 } })
+------------------------------------------------------------------
+-- Startup: check for an existing checkpoint
+------------------------------------------------------------------
+
+local function promptResumeOrFresh(cp)
+  local ago = os.time() - (cp.savedAt or os.time())
+  ui.clearArea(3, 3 + netBoxH, W - 4, 3)
+  log(string.format("Found checkpoint: series %s, step %d (n=%d), saved %ds ago.",
+    tostring(cp.seriesId), cp.stepsCompleted or 0, cp.n or 0, ago), ui.palette.accent2)
+  ui.footer("Resume from checkpoint? [r]esume / [f]resh start")
+  while true do
+    local ev, _, _char, code = event.pull("key_down")
+    if ev then
+      if code == keys.r then return true end
+      if code == keys.f then return false end
+    end
+  end
 end
 
-local startTime = computer.uptime()
-local lastDraw  = 0
-local snapN     = n
-local snapTime  = startTime
-local rate      = 0
+local cp = loadCheckpoint()
+local aBig, bBig
+if cp and cp.A and cp.B then
+  if promptResumeOrFresh(cp) then
+    state.seriesId = cp.seriesId
+    state.n = cp.n
+    state.limbsPerChunk = cp.limbsPerChunk
+    state.stepsCompleted = cp.stepsCompleted
+    state.A = cp.A
+    state.B = cp.B
+    state.phase = "GROWING"
+    log("Resumed series " .. tostring(state.seriesId) .. " at step " .. state.stepsCompleted .. ".", ui.palette.good)
+    log("If any storage nodes referenced by the checkpoint are offline,", ui.palette.dim)
+    log("growth will automatically wait for them to reconnect.", ui.palette.dim)
+  else
+    aBig, bBig = runBootstrap()
+    state.phase = "WAITING_FOR_STORAGE"
+  end
+else
+  aBig, bBig = runBootstrap()
+  state.phase = "WAITING_FOR_STORAGE"
+end
 
--- Draw the static frame once; the loop only refreshes data cells.
-drawFrame()
+drawNetwork(); drawProgress(); drawFooter()
+
+------------------------------------------------------------------
+-- Main loop
+------------------------------------------------------------------
 
 local running = true
-event.listen("interrupted", function() running = false end)
+local lastCheckpointStepCount = state.stepsCompleted
 
 while running do
-  local nextVal = parallelBigAdd(prev, curr)
-  n = n + 1
-  prev = curr
-  curr = nextVal
+  local msg, remoteAddr = net.pull(1)
+  if msg then
+    local ok, err = pcall(function()
+      if msg.type == "hello_compute" or msg.type == "hello_storage" or msg.type == "heartbeat" or msg.type == "bye" then
+        handleRegistryMessage(msg, remoteAddr)
+      elseif msg.type == "task_done" then
+        handleTaskDone(msg, remoteAddr)
+      end
+    end)
+    if not ok then log("message handler error: " .. tostring(err), ui.palette.bad) end
+  end
 
-  table.insert(sendQueue, { n, nextVal })
+  sweepDeadNodes()
 
-  if n % YIELD_EVERY == 0 then
-    local now = computer.uptime()
-
-    local currDigits  = decimalDigits(curr)
-    local currPreview = fastPreview(curr, W - 12)
-
-    local dt = now - snapTime
-    if dt >= STAT_INTERVAL then
-      rate = (n - snapN) / dt
-      snapN = n
-      snapTime = now
-    end
-
-    flushQueue()
-
-    if now - lastCkptTime >= CHECKPOINT_INTERVAL then
-      local ok, err = saveCheckpoint(n, prev, curr)
-      lastCkptTime = now
+  if state.phase == "WAITING_FOR_STORAGE" then
+    if #storageNodes() > 0 then
+      local ok, err = pcall(runSeeding, aBig, bBig)
+      aBig, bBig = nil, nil
+      collectgarbage()
       if ok then
-        lastCkptStatus = string.format("fib(%d)  %d digits  @ %.0f s",
-          n, currDigits, now - startTime)
-        lastCkptColor  = C.ckpt_ok
+        state.phase = "GROWING"
       else
-        lastCkptStatus = "FAILED: " .. tostring(err)
-        lastCkptColor  = C.bad
+        log("Seeding failed: " .. tostring(err), ui.palette.bad)
+        state.phase = "WAITING_FOR_STORAGE"
       end
     end
 
-    if now - lastStat >= STAT_INTERVAL then
-      lastStat = now
-      pollStats()
-      modem.broadcast(PORT, "STAT",
-        n, currDigits,
-        math.floor(rate * 10) / 10,
-        math.floor((now - startTime) * 10) / 10,
-        computer.freeMemory(), computer.totalMemory())
+  elseif state.phase == "GROWING" and not state.paused then
+    if not growth then
+      if #storageNodes() > 0 then
+        beginStep()
+      end
+    end
+    if growth then
+      dispatchPending()
+      sweepTaskTimeouts()
+      if growth.resolvedCount >= growth.total then
+        local ok, err = pcall(finalizeStep)
+        if not ok then
+          log("finalizeStep error: " .. tostring(err), ui.palette.bad)
+          growth = nil
+        end
+      end
     end
 
-    drainStats()
-
-    if now - lastDraw >= DRAW_INTERVAL then
-      lastDraw = now
-      drawStatus(n, currDigits, now - startTime, rate, currPreview)
+    local now = computer.uptime()
+    if (state.stepsCompleted - lastCheckpointStepCount >= CHECKPOINT_EVERY_STEPS)
+       or (now - state.lastCheckpointTime >= CHECKPOINT_EVERY_SECONDS and state.stepsCompleted > lastCheckpointStepCount) then
+      saveCheckpoint()
+      lastCheckpointStepCount = state.stepsCompleted
     end
+  end
 
-    os.sleep(0)
+  drawNetwork()
+  drawProgress()
+  drawFooter()
+
+  local ev, _, _char, code = event.pull(0, "key_down")
+  if ev then
+    if code == keys.q then
+      running = false
+    elseif code == keys.p then
+      state.paused = not state.paused
+      log(state.paused and "Paused." or "Resumed.", ui.palette.warn)
+    elseif code == keys.c then
+      saveCheckpoint()
+      lastCheckpointStepCount = state.stepsCompleted
+    end
   end
 end
 
-modem.close(PORT)
-if gpu then gpu.setForeground(C.value); gpu.setBackground(BG) end
-term.setCursor(1, H)
-print("\nStopped at fib(" .. n .. ").  Checkpoint: " .. CHECKPOINT_FILE)
+if state.A and state.B then saveCheckpoint() end
+net.broadcast(modems, { type = "master_shutdown" })
+term.clear()
+print("FibBench master stopped." .. (state.n > 0 and (" Last computed index: F(" .. state.n .. ")") or ""))

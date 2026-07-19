@@ -1,438 +1,388 @@
--- =============================================================
---  fibbenchstorage.lua  -  Fibonacci Chunk Storage Node  [OPTIMISED]
+-- fibbenchstorage.lua
 --
---  Stores chunked Fibonacci limbs in RAM first, then offloads to
---  disk as a swap-like backing store under pressure.
+-- FibBench STORAGE node.
 --
---  Optimisation notes (vs original):
---    1. redraw() now uses the already-maintained memCount counter
---       instead of iterating the entire store table with a for loop
---       on every redraw.
---    2. checkRAMPressure() returns early (before any iteration)
---       when memory usage is below the threshold, avoiding a full
---       table scan and compression pass that was being done even
---       when RAM was not under pressure.
--- =============================================================
+-- Role: holds numeric limb-chunks for the master's growing Fibonacci
+-- values on disk, so no single machine ever has to keep a whole huge
+-- number in RAM. On startup it lets you pick which mounted disk(s)
+-- to use. Chunks are placed across your chosen disks by a deterministic
+-- hash of their filename, so the same file always resolves to the same
+-- disk without needing a persisted index.
+--
+-- Run with: fibbenchstorage
 
 local component = require("component")
 local event     = require("event")
-local computer  = require("computer")
-local term      = require("term")
-local fs        = require("filesystem")
+local filesystem = require("filesystem")
+local serialization = require("serialization")
+local term = require("term")
+local computer = require("computer")
 
-if not component.isAvailable("modem") then
-  error("No modem component found - install a network card!")
+local scriptDir = (...) and (...):match("(.*/)") or ""
+if scriptDir == "" then
+  local ok, shell = pcall(require, "shell")
+  if ok then
+    local resolved = shell.resolve("fibbenchstorage.lua")
+    if resolved then scriptDir = resolved:match("(.*/)") or "" end
+  end
 end
+local common = dofile(scriptDir .. "fibbenchcommon.lua")
+local ui, net, util = common.ui, common.net, common.util
+local keys = net.keyboard.keys
 
-local modem = component.modem
-local gpu   = component.isAvailable("gpu") and component.gpu or nil
-local PORT  = 5757
-modem.open(PORT)
+------------------------------------------------------------------
+-- Disk selection wizard
+------------------------------------------------------------------
 
--- ── Optional: Data Card compression ──────────────────────────
-local dataCard       = nil
-local useCompression = false
-for addr in component.list("data") do
-  local ok, proxy = pcall(component.proxy, addr)
-  if ok and proxy then
-    local probeOk, probeResult = pcall(proxy.deflate, "probe")
-    if probeOk and type(probeResult) == "string" then
-      dataCard = proxy
-      useCompression = true
-      break
+local function discoverMounts()
+  local list = {}
+  for proxy, path in filesystem.mounts() do
+    local label = "(no label)"
+    local ok, l = pcall(proxy.getLabel)
+    if ok and l and l ~= "" then label = l end
+    local isTmp = (label:lower():find("tmpfs") ~= nil)
+    local total, used = 0, 0
+    pcall(function() total = proxy.spaceTotal() or 0 end)
+    pcall(function() used = proxy.spaceUsed() or 0 end)
+    if not (total ~= total) then -- guard NaN
+      list[#list + 1] = {
+        proxy = proxy, path = path, label = label,
+        total = total, used = used, tmpfs = isTmp,
+        isBoot = (path == "/"),
+      }
     end
   end
+  table.sort(list, function(a, b) return a.path < b.path end)
+  return list
 end
 
-local COMPRESS_MIN    = 64
-local totalSavedBytes = 0
+local function runDiskWizard()
+  term.clear()
+  local gpu, w, h = ui.init("FibBench Storage Node - Disk Selection")
+  ui.footer("Type disk numbers separated by commas, then press Enter (e.g. 1,3)")
 
-local function tryCompress(s)
-  if not useCompression or #s < COMPRESS_MIN then return s, false end
-  local ok, result = pcall(dataCard.deflate, s)
-  if ok and result and #result < #s then
-    totalSavedBytes = totalSavedBytes + (#s - #result)
-    return result, true
+  local mounts = discoverMounts()
+  ui.box(2, 3, w - 2, h - 6, "Available mounted filesystems")
+  local y = 5
+  ui.text(4, y, "#   Path                 Label                 Free / Total    Notes", ui.palette.dim)
+  y = y + 1
+  for i, m in ipairs(mounts) do
+    local free = m.total - m.used
+    local notes = {}
+    if m.isBoot then notes[#notes+1] = "boot/OS disk" end
+    if m.tmpfs then notes[#notes+1] = "tmpfs (NOT persistent!)" end
+    local line = string.format("%-3d %-20s %-20s %10s/%-9s %s",
+      i, m.path:sub(1, 20), m.label:sub(1, 20),
+      util.formatBytes(free), util.formatBytes(m.total),
+      table.concat(notes, ", "))
+    local color = ui.palette.text
+    if m.tmpfs then color = ui.palette.warn end
+    if m.isBoot then color = ui.palette.dim end
+    ui.text(4, y, line, color)
+    y = y + 1
   end
-  return s, false
-end
 
-local function tryDecompress(s, isCompressed)
-  if not isCompressed then return s end
-  if not useCompression then return s end
-  local ok, result = pcall(dataCard.inflate, s)
-  return (ok and result) and result or s
-end
-
--- ── Disk swap backing ────────────────────────────────────────
-local DISK_PATH   = "/home/fibcache/"
-local diskMeta    = {}  -- [key] = { compressed = bool }
-local diskCount   = 0
-local RAM_THRESH  = 0.80
-local offloadTotal = 0
-
-local function ensureDiskPath()
-  if not fs.exists(DISK_PATH) then
-    return pcall(fs.makeDirectory, DISK_PATH)
+  if #mounts == 0 then
+    ui.text(4, y + 1, "No filesystems found! Attach a disk and restart.", ui.palette.bad)
+    error("no filesystems available")
   end
-  return true
-end
 
--- ── Core state ────────────────────────────────────────────────
---  store[key] = { data = <string>, compressed = <bool>, idx = n, part = p, total = t }
-local store   = {}
-local count   = 0
-local memCount = 0   -- tracks #store entries without iterating the table
-local lastIdx = 0
-
-local myAddr = modem.address
-local orphanDrops = 0
-
-local function keyOf(idx, part)
-  return tostring(idx) .. ":" .. tostring(part)
-end
-
-local function diskFileOf(key)
-  return DISK_PATH .. (key:gsub("[^%w%-%_%.]", "_"))
-end
-
-local function removeFromDisk(key)
-  if diskMeta[key] then
-    local path = diskFileOf(key)
-    if fs.exists(path) then pcall(fs.remove, path) end
-    diskMeta[key] = nil
-    diskCount = math.max(0, diskCount - 1)
+  term.setCursor(4, h - 2)
+  gpu.setForeground(ui.palette.accent)
+  io.write("Select disk(s) for FibBench chunk storage: ")
+  gpu.setForeground(ui.palette.text)
+  local input
+  while true do
+    input = term.read()
+    if input then input = input:gsub("%s", "") end
+    if input and input ~= "" then
+      local chosen = {}
+      local valid = true
+      for numStr in input:gmatch("[^,]+") do
+        local idx = tonumber(numStr)
+        if not idx or not mounts[idx] then
+          valid = false
+        else
+          chosen[#chosen + 1] = mounts[idx]
+        end
+      end
+      if valid and #chosen > 0 then
+        return chosen
+      end
+    end
+    io.write("Invalid selection, try again (e.g. 1 or 1,2): ")
   end
 end
 
-local function removeRecord(key)
-  if store[key] then
-    store[key] = nil
-    memCount = math.max(0, memCount - 1)
-  end
-  removeFromDisk(key)
-end
+------------------------------------------------------------------
+-- Chunk storage backend
+------------------------------------------------------------------
 
-local function offloadEntry(key)
-  local entry = store[key]
-  if not entry or diskMeta[key] then return false end
-  if not ensureDiskPath() then return false end
+local CHUNK_DIR = "fibbench_chunks"
 
-  local data, compressed = entry.data, entry.compressed
-  if not compressed and useCompression then
-    local ok, result = pcall(dataCard.deflate, data)
-    if ok and result and #result < #data then
-      totalSavedBytes = totalSavedBytes + (#data - #result)
-      data = result
-      compressed = true
+local Storage = {}
+Storage.__index = Storage
+
+function Storage.new(disks)
+  local self = setmetatable({}, Storage)
+  self.disks = disks
+  self.reads, self.writes, self.deletes = 0, 0, 0
+  for _, d in ipairs(disks) do
+    local dirPath = filesystem.concat(d.path, CHUNK_DIR)
+    if not filesystem.exists(dirPath) then
+      filesystem.makeDirectory(dirPath)
     end
   end
+  return self
+end
 
-  local path = diskFileOf(key)
-  local f = io.open(path, "wb")
-  if not f then return false end
-  local ok = pcall(function() f:write(data) end)
+local function hashFilename(name, n)
+  local h = 0
+  for i = 1, #name do h = (h * 31 + name:byte(i)) % 2147483647 end
+  return (h % n) + 1
+end
+
+function Storage:diskFor(filename)
+  return self.disks[hashFilename(filename, #self.disks)]
+end
+
+function Storage:fullPath(filename)
+  local d = self:diskFor(filename)
+  return filesystem.concat(d.path, CHUNK_DIR, filename), d
+end
+
+function Storage:store(filename, data)
+  local path = self:fullPath(filename)
+  local f, err = io.open(path, "w")
+  if not f then return false, err end
+  f:write(serialization.serialize(data))
   f:close()
-  if not ok then return false end
-
-  diskMeta[key] = { compressed = compressed }
-  store[key] = nil
-  memCount = math.max(0, memCount - 1)
-  diskCount = diskCount + 1
-  offloadTotal = offloadTotal + 1
+  self.writes = self.writes + 1
   return true
 end
 
--- OPTIMISED: returns immediately (without touching the store table
--- at all) when RAM usage is below the threshold.  The original
--- always ran a full compression pass first, then checked the
--- threshold again -- this scan was wasted work the vast majority
--- of the time when memory was healthy.
-local function checkRAMPressure()
-  local total = computer.totalMemory()
-  if total <= 0 then return 0 end
+function Storage:fetch(filename)
+  local path = self:fullPath(filename)
+  local f = io.open(path, "r")
+  if not f then return nil, "missing chunk: " .. filename end
+  local raw = f:read("*a")
+  f:close()
+  local ok, data = pcall(serialization.unserialize, raw)
+  if not ok then return nil, "corrupt chunk: " .. filename end
+  self.reads = self.reads + 1
+  return data
+end
 
-  -- Fast early exit: nothing to do when under threshold.
-  if (1 - computer.freeMemory() / total) <= RAM_THRESH then return 0 end
+function Storage:delete(filename)
+  local path = self:fullPath(filename)
+  if filesystem.exists(path) then
+    filesystem.remove(path)
+  end
+  self.deletes = self.deletes + 1
+  return true
+end
 
-  -- RAM is tight -- attempt in-place compression first.
-  if useCompression then
-    for _, entry in pairs(store) do
-      if not entry.compressed then
-        local ok, result = pcall(dataCard.deflate, entry.data)
-        if ok and result and #result < #entry.data then
-          totalSavedBytes = totalSavedBytes + (#entry.data - #result)
-          entry.data = result
-          entry.compressed = true
+-- Inventory scan (for master resume support): returns list of filenames
+-- currently present across all selected disks.
+function Storage:inventory()
+  local files = {}
+  for _, d in ipairs(self.disks) do
+    local dirPath = filesystem.concat(d.path, CHUNK_DIR)
+    if filesystem.exists(dirPath) then
+      for name in filesystem.list(dirPath) do
+        if not name:match("/$") then
+          files[#files + 1] = name
         end
       end
     end
-    collectgarbage("collect")
   end
-
-  -- Re-check after compression.
-  if (1 - computer.freeMemory() / total) <= RAM_THRESH then return 0 end
-
-  -- Still tight -- offload largest entries to disk.
-  local candidates = {}
-  for key, entry in pairs(store) do
-    candidates[#candidates + 1] = { key = key, size = #entry.data }
-  end
-  table.sort(candidates, function(a, b) return a.size > b.size end)
-
-  local moved = 0
-  for _, item in ipairs(candidates) do
-    if (1 - computer.freeMemory() / total) <= RAM_THRESH then break end
-    if offloadEntry(item.key) then moved = moved + 1 end
-  end
-  return moved
+  return files
 end
 
-local function maybeLoadFromDisk(key)
-  if store[key] then return store[key] end
-  local meta = diskMeta[key]
-  if not meta then return nil end
-  local path = diskFileOf(key)
-  local f = io.open(path, "rb")
-  if not f then return nil end
-  local data = f:read("*a") or ""
-  f:close()
-  data = tryDecompress(data, meta.compressed)
-  return { data = data, compressed = meta.compressed }
-end
-
-local function storeRecord(idx, part, total, rawVal)
-  local key = keyOf(idx, part)
-  if store[key] or diskMeta[key] then
-    removeRecord(key)
+function Storage:usageSnapshot()
+  local snap = {}
+  for i, d in ipairs(self.disks) do
+    local total, used = d.total, 0
+    pcall(function() used = d.proxy.spaceUsed() or 0 end)
+    pcall(function() total = d.proxy.spaceTotal() or total end)
+    snap[i] = { path = d.path, label = d.label, used = used, total = total }
   end
-
-  local data, compressed = tryCompress(rawVal)
-  store[key] = {
-    data = data,
-    compressed = compressed,
-    idx = idx,
-    part = part,
-    total = total,
-  }
-  memCount = memCount + 1
-  count = count + 1
-  if idx > lastIdx then lastIdx = idx end
-  return key
+  return snap
 end
 
-local function fetchRecord(idx, part)
-  local key = keyOf(idx, part)
-  local entry = store[key]
-  if entry then
-    return entry.data, entry.total, entry.compressed, key
-  end
-  local diskEntry = maybeLoadFromDisk(key)
-  if diskEntry then
-    return diskEntry.data, nil, diskEntry.compressed, key
-  end
-  return nil, nil, nil, key
+------------------------------------------------------------------
+-- Main
+------------------------------------------------------------------
+
+local disks = runDiskWizard()
+local storage = Storage.new(disks)
+
+local gpu, W, H = ui.init("FibBench Storage Node")
+local logPanel = ui.newLog(3, 16, W - 4, H - 18)
+ui.box(2, 15, W - 2, H - 16, "Log")
+ui.box(2, 2, W - 2, 5, "Connection")
+ui.box(2, 8, W - 2, 6, "Disks")
+
+local modems = net.openModems()
+local myId = net.myAddress(modems)
+if #modems == 0 then
+  logPanel:push("WARNING: no modem found - cannot join a network.", ui.palette.bad)
 end
 
-local function purgeRecord(idx, part)
-  removeRecord(keyOf(idx, part))
-end
-
--- ── UI ────────────────────────────────────────────────────────
-local BG = 0x000000
-local C = {
-  border   = 0x1A4A7A,
-  header   = 0x33AAFF,
-  label    = 0x778899,
-  value    = 0xEEEEEE,
-  number   = 0xFFDD44,
-  good     = 0x44CC44,
-  warn     = 0xFF9900,
-  bad      = 0xFF4444,
-  dim      = 0x333344,
-  status   = 0x88CCFF,
-  op_store = 0x44EE44,
-  op_fetch = 0xFFDD44,
-  op_ping  = 0x33AAFF,
-  compress = 0xAA88FF,
-  disk     = 0xFF8844,
+local state = {
+  masterAddr = nil,
+  masterName = nil,
+  seriesId = nil,
+  connected = false,
+  lastMasterSeen = 0,
 }
 
-local statusMsg = "Waiting for master ...  (Ctrl-C to quit)"
-local statusCol = C.status
-
-local W, H = 80, 25
-if gpu then W, H = gpu.getResolution() end
-
-local function cls()
-  if gpu then
-    gpu.setBackground(BG)
-    gpu.setForeground(C.value)
-    gpu.fill(1, 1, W, H, " ")
+local function drawConnection()
+  ui.clearArea(4, 3, W - 6, 3)
+  if state.connected then
+    ui.text(4, 3, "Status:  CONNECTED", ui.palette.good)
+    ui.text(4, 4, "Master:  " .. util.shortId(state.masterAddr) .. "  (" .. (state.masterName or "?") .. ")", ui.palette.text)
+    ui.text(4, 5, "Series:  " .. (state.seriesId or "-"), ui.palette.dim)
   else
-    term.clear()
+    ui.text(4, 3, "Status:  SEARCHING FOR MASTER...", ui.palette.warn)
+    ui.text(4, 4, "My address: " .. util.shortId(myId), ui.palette.dim)
   end
 end
 
-local function put(x, y, text, fg, bg)
-  if not gpu or y < 1 or y > H or x > W then return end
-  gpu.setBackground(bg or BG)
-  gpu.setForeground(fg or C.value)
-  local s = tostring(text or "")
-  if x < 1 then s = s:sub(2 - x); x = 1 end
-  if x + #s - 1 > W then s = s:sub(1, W - x + 1) end
-  if #s > 0 then gpu.set(x, y, s) end
+local function drawDisks()
+  ui.clearArea(4, 9, W - 6, 4)
+  local snap = storage:usageSnapshot()
+  local y = 9
+  for i, d in ipairs(snap) do
+    if y > 12 then break end
+    local frac = d.total > 0 and (d.used / d.total) or 0
+    local label = string.format("%d) %s [%s]", i, d.path, d.label)
+    ui.text(4, y, label:sub(1, 40), ui.palette.text)
+    ui.progressBar(46, y, W - 50, frac, frac > 0.85 and ui.palette.bad or ui.palette.accent)
+    y = y + 1
+  end
 end
 
-local function hline(y, fg)
-  put(1, y, "+" .. ("-"):rep(W - 2) .. "+", fg or C.border)
+local function drawFooter()
+  ui.footer(string.format(
+    "reads:%d  writes:%d  deletes:%d   |   q = quit and deregister",
+    storage.reads, storage.writes, storage.deletes))
 end
 
-local function pad(s, w)
-  s = tostring(s or "")
-  if #s > w then return s:sub(1, w) end
-  return s .. (" "):rep(w - #s)
+drawConnection()
+drawDisks()
+drawFooter()
+logPanel:push("Storage node ready. Disks: " .. #disks .. ". Address: " .. util.shortId(myId), ui.palette.accent)
+
+local function sendHello()
+  local inv = storage:inventory()
+  net.broadcast(modems, {
+    type = "hello_storage",
+    role = "storage",
+    id = myId,
+    disks = (function()
+      local out = {}
+      for _, d in ipairs(disks) do out[#out+1] = { path = d.path, label = d.label } end
+      return out
+    end)(),
+    inventoryCount = #inv,
+    inventory = inv,
+  })
 end
 
-local function drawBar(x, y, barW, free, total)
-  local pct = (total > 0) and (1 - free / total) or 0
-  local filled = math.max(0, math.min(barW, math.floor(pct * barW)))
-  local col = (pct < 0.5) and C.good or (pct < 0.8) and C.warn or C.bad
-  put(x,              y, "[",                      C.border)
-  put(x + 1,          y, ("#"):rep(filled),        col)
-  put(x + 1 + filled, y, ("."):rep(barW - filled), C.dim)
-  put(x + 1 + barW,   y, "]",                      C.border)
-  put(x + barW + 2,   y, string.format("%3d%%", math.floor(pct * 100)), col)
-end
+local lastHelloOrHeartbeat = 0
 
--- OPTIMISED: uses memCount (already maintained by storeRecord /
--- removeRecord) instead of iterating the whole store table on
--- every single redraw call.
-local function redraw()
-  local free  = computer.freeMemory()
-  local total = computer.totalMemory()
+local function handleMessage(msg, remoteAddr)
+  if msg.type == "welcome" and msg.to == myId then
+    state.connected = true
+    state.masterAddr = remoteAddr
+    state.masterName = msg.name
+    state.seriesId = msg.seriesId
+    state.lastMasterSeen = computer.uptime()
+    logPanel:push("Registered with master " .. util.shortId(remoteAddr) .. " as " .. tostring(msg.name), ui.palette.good)
+    drawConnection()
 
-  put(2, 4, " mem   : ", C.label)
-  put(11, 4, pad(tostring(memCount), 7), C.number)
-  put(19, 4, " disk  : ", C.label)
-  put(28, 4, pad(tostring(diskCount), 6), diskCount > 0 and C.disk or C.dim)
-  put(35, 4, " last  : ", C.label)
-  put(44, 4, pad(lastIdx > 0 and string.format("fib(%d)", lastIdx) or "none", 14), lastIdx > 0 and C.number or C.dim)
-  put(2, 6, " RAM  ", C.label)
-  drawBar(8, 6, math.max(4, W - 15), free, total)
-
-  put(2, 8, " cmp   : ", C.label)
-  local cmpStr
-  if useCompression then
-    if totalSavedBytes >= 1048576 then
-      cmpStr = string.format("ON  [saved %dMB]", math.floor(totalSavedBytes / 1048576))
-    elseif totalSavedBytes >= 1024 then
-      cmpStr = string.format("ON  [saved %dKB]", math.floor(totalSavedBytes / 1024))
-    else
-      cmpStr = string.format("ON  [saved %dB]", totalSavedBytes)
+  elseif msg.type == "master_shutdown" then
+    if state.connected and remoteAddr == state.masterAddr then
+      logPanel:push("Master shut down. Returning to search mode.", ui.palette.warn)
+      state.connected = false
+      state.masterAddr = nil
+      drawConnection()
     end
-  else
-    cmpStr = "OFF  (no tier-2 data card)"
-  end
-  put(11, 8, pad(cmpStr, 28), useCompression and C.compress or C.dim)
-  put(40, 8, " offloaded: ", C.label)
-  put(52, 8, pad(tostring(offloadTotal), W - 53), offloadTotal > 0 and C.disk or C.dim)
 
-  put(2, 10, " status : ", C.label)
-  put(12, 10, pad(statusMsg, W - 13), statusCol)
+  elseif msg.type == "fetch_chunk" and msg.path then
+    state.lastMasterSeen = computer.uptime()
+    local data, err = storage:fetch(msg.path)
+    net.send(modems, msg.from or remoteAddr, {
+      type = "chunk_data", replyId = msg.replyId, ok = (data ~= nil), data = data, err = err,
+    })
+    logPanel:push("fetch " .. msg.path .. (data and " OK" or (" FAIL: " .. tostring(err))),
+      data and ui.palette.text or ui.palette.bad)
+    drawFooter()
+
+  elseif msg.type == "store_chunk" and msg.path then
+    state.lastMasterSeen = computer.uptime()
+    local ok, err = storage:store(msg.path, msg.data)
+    net.send(modems, msg.from or remoteAddr, {
+      type = "store_ack", replyId = msg.replyId, ok = ok, err = err,
+    })
+    logPanel:push("store " .. msg.path .. (ok and " OK" or (" FAIL: " .. tostring(err))),
+      ok and ui.palette.text or ui.palette.bad)
+    drawFooter()
+    drawDisks()
+
+  elseif msg.type == "delete_chunk" and msg.path then
+    state.lastMasterSeen = computer.uptime()
+    storage:delete(msg.path)
+    if msg.replyId then
+      net.send(modems, msg.from or remoteAddr, { type = "delete_ack", replyId = msg.replyId, ok = true })
+    end
+    drawFooter()
+    drawDisks()
+  end
 end
 
-local function drawFrame()
-  cls()
-  hline(1)
-  put(1, 2, "|", C.border)
-  put(2, 2, pad("  STORAGE NODE  [" .. myAddr:sub(1, 8) .. "...]", W - 2), C.header)
-  put(W, 2, "|", C.border)
-  hline(3)
-  for _, row in ipairs({4, 6, 8, 10}) do
-    put(1, row, "|", C.border)
-    put(W, row, "|", C.border)
-  end
-  hline(5)
-  hline(7)
-  hline(9)
-  hline(11)
-end
+sendHello()
 
--- ── Event loop ────────────────────────────────────────────────
 local running = true
-local function onInterrupt() running = false end
-event.listen("interrupted", onInterrupt)
-
-drawFrame()
-redraw()
-
 while running do
-  local ev, _, sender, port, _, cmd, a1, a2, a3, a4 = event.pull(2, "modem_message")
-
-  if ev and port == PORT then
-    if cmd == "PING" then
-      modem.send(sender, PORT, "PONG", computer.freeMemory(), computer.totalMemory(), count)
-      statusMsg = string.format("PING from %.8s...", sender)
-      statusCol = C.op_ping
-
-    elseif cmd == "STAT" then
-      modem.send(sender, PORT, "STAT", computer.freeMemory(), computer.totalMemory(), count)
-
-    elseif cmd == "STORE" then
-      local idx, part, total = tonumber(a1), tonumber(a2), tonumber(a3)
-      local data = a4 or ""
-      if idx and part and total then
-        storeRecord(idx, part, total, data)
-        modem.send(sender, PORT, "ACK", idx, part)
-        statusMsg = string.format("STORE fib(%d) part %d/%d [%d bytes]", idx, part, total, #data)
-        statusCol = C.op_store
-        if checkRAMPressure() > 0 then
-          statusMsg = string.format("RAM >80%%: offloaded to disk  (total %d)", offloadTotal)
-          statusCol = C.disk
-        end
-      end
-
-    elseif cmd == "FETCH" then
-      local idx, part = tonumber(a1), tonumber(a2)
-      local deleteAfter = tostring(a3) == "1"
-      if idx and part then
-        local data, total, compressed, key = fetchRecord(idx, part)
-        if data then
-          modem.send(sender, PORT, "GOT", idx, part, total or 0, data)
-          statusMsg = string.format("FETCH fib(%d) part %d%s", idx, part, deleteAfter and " delete" or "")
-          statusCol = C.op_fetch
-          if deleteAfter then removeRecord(key) end
-        else
-          modem.send(sender, PORT, "ERR", "missing", idx, part)
-          statusMsg = string.format("FETCH miss fib(%d) part %d", idx, part)
-          statusCol = C.warn
-        end
-      end
-
-    elseif cmd == "PURGE" then
-      local idx, part = tonumber(a1), tonumber(a2)
-      if idx and part then
-        purgeRecord(idx, part)
-        statusMsg = string.format("PURGE fib(%d) part %d", idx, part)
-        statusCol = C.warn
-      end
-
-    elseif cmd == "QUIT" then
-      running = false
+  local timeout = 2
+  local msg, remoteAddr = net.pull(timeout)
+  if msg then
+    local ok, err = pcall(handleMessage, msg, remoteAddr)
+    if not ok then
+      logPanel:push("handler error: " .. tostring(err), ui.palette.bad)
     end
+  end
 
-    redraw()
-  else
-    if checkRAMPressure() > 0 then
-      statusMsg = string.format("RAM >80%%: offloaded to disk  (total %d)", offloadTotal)
-      statusCol = C.disk
+  local now = computer.uptime()
+  if not state.connected and (now - lastHelloOrHeartbeat) >= 2 then
+    sendHello()
+    lastHelloOrHeartbeat = now
+  elseif state.connected then
+    if (now - lastHelloOrHeartbeat) >= common.HEARTBEAT_INTERVAL then
+      net.send(modems, state.masterAddr, {
+        type = "heartbeat", id = myId, role = "storage",
+        stats = { reads = storage.reads, writes = storage.writes, deletes = storage.deletes },
+      })
+      lastHelloOrHeartbeat = now
     end
-    redraw()
+    if state.lastMasterSeen > 0 and (now - state.lastMasterSeen) > common.HEARTBEAT_TIMEOUT then
+      logPanel:push("Lost contact with master. Returning to search mode.", ui.palette.warn)
+      state.connected = false
+      state.masterAddr = nil
+      drawConnection()
+    end
+  end
+
+  local ev, _, _char, code = event.pull(0, "key_down")
+  if ev and code == keys.q then
+    running = false
   end
 end
 
-event.ignore("interrupted", onInterrupt)
-modem.close(PORT)
-if gpu then gpu.setForeground(C.value); gpu.setBackground(BG) end
-print("\n[Storage] Shut down cleanly.")
+if state.connected then
+  net.send(modems, state.masterAddr, { type = "bye", id = myId, role = "storage" })
+end
+term.clear()
+print("FibBench storage node stopped.")
