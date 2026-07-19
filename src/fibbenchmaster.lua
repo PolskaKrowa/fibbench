@@ -326,6 +326,12 @@ local function handleRegistryMessage(msg, remoteAddr)
     if nodes[remoteAddr] then
       nodes[remoteAddr].lastSeen = computer.uptime()
       nodes[remoteAddr].stats = msg.stats or nodes[remoteAddr].stats
+      -- Ack it. Without this, a worker with nothing to do for
+      -- HEARTBEAT_TIMEOUT seconds has no way to know the master heard
+      -- its heartbeats, and will conclude it lost the master even
+      -- though it never actually did - see fibbenchcompute.lua's
+      -- handleMessage for the other half of this fix.
+      net.send(modems, remoteAddr, { type = "heartbeat_ack", to = remoteAddr })
     else
       -- missed the original hello; re-register from the heartbeat
       local n2 = registerNode(remoteAddr, msg.role or "compute", msg.stats)

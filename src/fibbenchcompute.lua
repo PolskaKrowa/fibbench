@@ -204,6 +204,17 @@ local function handleTask(msg, remoteAddr)
 end
 
 local function handleMessage(msg, remoteAddr)
+  -- Any traffic at all from our current master is proof it's still there,
+  -- not just the two message types that happened to update this before.
+  -- This is what actually fixes the false "lost contact" loop: previously
+  -- an idle worker's clock only got refreshed by "welcome" (once) or
+  -- "task_chunk_add" (only while there's work), so it would time itself
+  -- out and re-register - always landing on the same name, since the
+  -- master never actually forgot it either.
+  if state.connected and remoteAddr == state.masterAddr then
+    state.lastMasterSeen = computer.uptime()
+  end
+
   if msg.type == "welcome" and msg.to == myId then
     state.connected = true
     state.masterAddr = remoteAddr
