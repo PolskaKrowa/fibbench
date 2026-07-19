@@ -374,8 +374,15 @@ end
 -- refines it with a couple of measured correction passes.
 ------------------------------------------------------------------
 
+local function gc()
+  -- Some OpenOS builds/BIOS variants don't expose the standard Lua
+  -- `collectgarbage` global. Fall back to no-op if it's missing rather
+  -- than crashing calibration.
+  if collectgarbage then collectgarbage() end
+end
+
 local function calibrateBytesPerLimb()
-  collectgarbage()
+  gc()
   local free1 = computer.freeMemory()
   local probe = {}
   local N = 20000
@@ -383,7 +390,7 @@ local function calibrateBytesPerLimb()
   local free2 = computer.freeMemory()
   local delta = free1 - free2
   probe = nil
-  collectgarbage()
+  gc()
   if delta <= 0 then delta = N * 16 end -- sane fallback if GC raced us
   return delta / N
 end
