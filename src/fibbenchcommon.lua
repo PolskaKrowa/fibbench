@@ -402,7 +402,7 @@ function common.bootstrapFindMaxFib(progressCb)
   local function report(s) if progressCb then progressCb(s) end end
 
   local totalMem = computer.totalMemory()
-  local budgetBytes = totalMem * 0.5
+  local budgetBytes = totalMem * 0.1
   local bytesPerLimb = calibrateBytesPerLimb()
   local overhead = 1.2 -- fudge factor for bigint table/GC bookkeeping
 

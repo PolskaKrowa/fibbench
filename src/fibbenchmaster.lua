@@ -369,7 +369,7 @@ local function runBootstrap()
   state.phase = "BOOTSTRAP"
   drawProgress()
   log("Starting bootstrap: searching for the largest Fibonacci number", ui.palette.accent2)
-  log("that fits in half of this machine's memory (fast doubling)...", ui.palette.accent2)
+  log("that fits in 10% of this machine's memory (fast doubling)...", ui.palette.accent2)
   local n, a, b = common.bootstrapFindMaxFib(function(s) log(s, ui.palette.dim) end)
   state.n = n + 1 -- B represents F(n+1)
   state.seriesId = util.newSeriesId()
