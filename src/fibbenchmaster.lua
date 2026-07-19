@@ -647,7 +647,7 @@ while running do
     if #storageNodes() > 0 then
       local ok, err = pcall(runSeeding, aBig, bBig)
       aBig, bBig = nil, nil
-      collectgarbage()
+      if collectgarbage then collectgarbage() end
       if ok then
         state.phase = "GROWING"
       else
