@@ -274,7 +274,11 @@ local function addMagKS(a, b)
       end
     end
     d = d * 2
-    if d <= n and math.floor(d / 2) % 65536 == 0 then yield() end
+    -- Yield after each prefix-scan round. Each round touches ~n limbs
+    -- and there are log2(n) rounds; without this, the old condition
+    -- (math.floor(d/2) % 65536 == 0) NEVER fired for n < 131072, so
+    -- the entire prefix scan ran without a single yield.
+    yield()
   end
 
   -- Pass 3: final sums. carry into position 1 is 0; carry into position i>1
@@ -450,6 +454,12 @@ local function divSmall(x, d)
     local cur = carry * BASE + x[i]
     r[i] = math.floor(cur / d)
     carry = cur % d
+    -- Yield periodically so the OC "too long without yielding"
+    -- watchdog doesn't kill the bootstrap. divSmall is called 3x per
+    -- Toom-Cook 3 interpolation, each time walking the full operand
+    -- from high limb to low; without this, a 10000-limb division
+    -- runs ~10k iterations without yielding and trips the watchdog.
+    if i % 20000 == 0 then yield() end
   end
   r.n = x.n
   r.sign = sign
@@ -909,6 +919,10 @@ function bigint.chunkReduceGP(g, p, limbsPerChunk)
       pAcc[i] = newP
     end
     d = d * 2
+    -- Yield after each round so the OC watchdog doesn't trip on
+    -- large chunks (DEFAULT_CHUNK_LIMBS=500 -> 9 rounds, ~4500 ops;
+    -- not huge, but combined with other work it adds up).
+    yield()
   end
   -- Final per-chunk gOut/pOut come from the last limb.
   local gOut = gAcc[limbsPerChunk] or 0
@@ -1041,7 +1055,26 @@ function common.bootstrapFindMaxFib(progressCb)
   local totalMem = computer.totalMemory()
   local budgetBytes = totalMem * 0.1
   local bytesPerLimb = calibrateBytesPerLimb()
-  local overhead = 1.2 -- fudge factor for bigint table/GC bookkeeping
+  -- The overhead factor must account for PEAK TRANSIENT memory during
+  -- the fast-doubling recursion, not just the final result size:
+  --   * The result pair F(n), F(n+1) lives in memory simultaneously: 2x result
+  --   * Toom-Cook 3 multiplication of two N-limb operands allocates:
+  --       - 6 evaluation points (aP1, aM1, aP2, bP1, bM1, bP2):    6 * N/3 = 2N
+  --       - 5 pointwise products (sequential, but 1 alive + result): 2N/3 + 2N/3
+  --       - ~12 interpolation temporaries (Wsum, Wdiff, D, r0..r4, ...): ~8N
+  --     Peak during one mul: ~12N where N is the operand (= result/2)
+  --   * Kogge-Stone addition allocates 3 extra arrays (g, p, s):  3N per add
+  --   * The fast-doubling stack frame holds a, b, c, d simultaneously: ~3N
+  -- Total peak ~= 9x the result size in limbs. With bytesPerLimb ~16,
+  -- that's ~144 bytes per result-limb of transient overhead.
+  --
+  -- The original Karatsuba-only code used overhead=1.2, which gave a
+  -- peak of ~5x result (42% of totalMem) - aggressive but workable.
+  -- With Toom-Cook 3, overhead=1.2 would give a peak of ~9x result
+  -- (75% of totalMem) - too aggressive, causes OOM on many OC setups.
+  -- overhead=2.5 brings the peak back to ~36% of totalMem, matching
+  -- the original Karatsuba safety margin.
+  local overhead = 2.5
 
   report(string.format("Total memory: %d bytes | budget (10%%): %d bytes",
     math.floor(totalMem), math.floor(budgetBytes)))
@@ -1057,38 +1090,64 @@ function common.bootstrapFindMaxFib(progressCb)
   -- one just to shave off a couple of percent. A small conservative
   -- pre-shrink makes the first trial land under budget in the common case,
   -- so it can usually be accepted immediately.
-  n = math.floor(n * 0.999)
+  -- Use a slightly more aggressive pre-shrink (0.95 instead of 0.999)
+  -- to give extra headroom for Toom-Cook 3's transient memory on the
+  -- first trial; subsequent trials correct upward if there's room.
+  n = math.floor(n * 0.95)
   n = math.max(n, 10)
 
   local best = nil
   for attempt = 1, 4 do
     report(string.format("Trial %d: computing F(%d) via fast doubling...", attempt, n))
-    local a, b = bigint.fibFastDoubling(n)
-    local actualBytes = b.n * bytesPerLimb * overhead
-    report(string.format("  F(%d) uses %d limbs (~%d digits, ~%.0f bytes)",
-      n, b.n, bigint.digitCount(b), actualBytes))
-    if actualBytes <= budgetBytes then
-      best = { n = n, a = a, b = b, bytes = actualBytes }
-      local ratio = budgetBytes / math.max(actualBytes, 1)
-      if ratio < 1.02 then break end
-      local nextN = math.floor(n * math.min(ratio, 1.5))
-      if nextN <= n then break end
-      n = nextN
+    -- Force GC before each trial so the bytesPerLimb measurement from
+    -- calibration isn't distorted by leftover intermediates from the
+    -- previous attempt. This also frees up as much memory as possible
+    -- before the heavy fibFastDoubling allocation.
+    gc()
+    -- Wrap in pcall so an OOM or watchdog inside fibFastDoubling doesn't
+    -- crash the entire bootstrap - instead we treat it as "n was too
+    -- big" and try a smaller value.
+    local ok, a, b = pcall(bigint.fibFastDoubling, n)
+    if not ok then
+      report(string.format("  Trial %d failed (OOM or timeout): %s", attempt, tostring(a)))
+      if best then break end
+      -- Shrink aggressively and retry
+      n = math.floor(n * 0.5)
+      if n < 10 then break end
     else
-      -- Tight correction (no extra fudge beyond a hair of safety margin):
-      -- the estimate is already close, so overshoot here should be small
-      -- and we want this to be the LAST expensive trial, not another
-      -- pessimistic guess that then needs its own correction.
-      local ratio = budgetBytes / actualBytes
-      local nextN = math.floor(n * ratio * 0.999)
-      if best and nextN <= best.n then break end
-      n = math.max(nextN, 1)
+      local actualBytes = b.n * bytesPerLimb * overhead
+      report(string.format("  F(%d) uses %d limbs (~%d digits, ~%.0f bytes)",
+        n, b.n, bigint.digitCount(b), actualBytes))
+      if actualBytes <= budgetBytes then
+        best = { n = n, a = a, b = b, bytes = actualBytes }
+        local ratio = budgetBytes / math.max(actualBytes, 1)
+        if ratio < 1.02 then break end
+        local nextN = math.floor(n * math.min(ratio, 1.5))
+        if nextN <= n then break end
+        n = nextN
+      else
+        -- Tight correction (no extra fudge beyond a hair of safety margin):
+        -- the estimate is already close, so overshoot here should be small
+        -- and we want this to be the LAST expensive trial, not another
+        -- pessimistic guess that then needs its own correction.
+        local ratio = budgetBytes / actualBytes
+        local nextN = math.floor(n * ratio * 0.95)
+        if best and nextN <= best.n then break end
+        n = math.max(nextN, 1)
+      end
     end
   end
 
   if not best then
     n = math.max(n - 1, 1)
-    local a, b = bigint.fibFastDoubling(n)
+    gc()
+    local ok, a, b = pcall(bigint.fibFastDoubling, n)
+    if not ok then
+      -- Last-resort: try a very small n so the master can at least start.
+      report("All trials failed; falling back to F(1000).")
+      n = 1000
+      a, b = bigint.fibFastDoubling(n)
+    end
     best = { n = n, a = a, b = b, bytes = b.n * bytesPerLimb * overhead }
   end
 
