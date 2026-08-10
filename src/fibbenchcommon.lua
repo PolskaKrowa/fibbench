@@ -685,7 +685,7 @@ end
 local seriesCounter = 0
 function util.newSeriesId()
   seriesCounter = seriesCounter + 1
-  return string.format("fb%d%04x", os.time(), math.random(0, 0xFFFF))
+  return string.format("fb%d%04x", math.floor(os.time()), math.random(0, 0xFFFF))
 end
 
 function util.tableCount(t)
