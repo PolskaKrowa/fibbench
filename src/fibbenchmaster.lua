@@ -82,8 +82,8 @@ local CHECKPOINT_EVERY_SECONDS = 120
 -- Configuration
 --
 -- Selects which distributed addition algorithm the GROWTH phase uses.
---   "carry_select" (default) - 2x chunk parallelism per wave, 1 wave
---   "kogge_stone"           - 1x chunk parallelism per wave, 2 waves,
+--   "carry_select"           - 2x chunk parallelism per wave, 1 wave
+--   "kogge_stone" (default)  - 1x chunk parallelism per wave, 2 waves,
 --                              but the cross-chunk carry is resolved
 --                              in O(log N) on the master instead of
 --                              chunk-by-chunk at the network.
@@ -93,8 +93,8 @@ local CHECKPOINT_EVERY_SECONDS = 120
 -- fibbenchcompute.lua), so the master can switch algorithms between
 -- runs without redeploying compute nodes.
 ------------------------------------------------------------------
-local ADD_ALGORITHM = os.getenv and os.getenv("ADD_ALGORITHM") or "carry_select"
-if ADD_ALGORITHM ~= "kogge_stone" then ADD_ALGORITHM = "carry_select" end
+local ADD_ALGORITHM = os.getenv and os.getenv("ADD_ALGORITHM") or "kogge_stone"
+if ADD_ALGORITHM ~= "carry_select" then ADD_ALGORITHM = "kogge_stone" end
 
 ------------------------------------------------------------------
 -- TUI setup
