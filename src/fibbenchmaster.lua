@@ -918,10 +918,17 @@ end
 ------------------------------------------------------------------
 
 local function promptResumeOrFresh(cp)
-  local ago = os.time() - (cp.savedAt or os.time())
+  -- os.time() on OpenComputers / Lua 5.3+ returns a FLOAT (Unix time
+  -- with fractional seconds). Subtracting two such floats yields a
+  -- float, and string.format("%d", x) raises
+  --   "bad argument #N to 'format' (number has no integer representation)"
+  -- if x has a fractional part. Floor both ends so the subtraction is
+  -- always over integers (and the result is always integral).
+  local now  = math.floor(os.time())
+  local ago  = now - math.floor(cp.savedAt or now)
   ui.clearArea(3, 3 + netBoxH, W - 4, 3)
   log(string.format("Found checkpoint: series %s, step %d (n=%d), saved %ds ago.",
-    tostring(cp.seriesId), cp.stepsCompleted or 0, cp.n or 0, ago), ui.palette.accent2)
+    tostring(cp.seriesId), math.floor(cp.stepsCompleted or 0), math.floor(cp.n or 0), ago), ui.palette.accent2)
   ui.footer("Resume from checkpoint? [r]esume / [f]resh start")
   while true do
     local ev, _, _char, code = event.pull("key_down")
