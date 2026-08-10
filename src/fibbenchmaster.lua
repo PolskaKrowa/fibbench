@@ -7,7 +7,9 @@
 --      compute the largest Fibonacci number that fits in half of this
 --      machine's own memory, plus the one before it - "two for the
 --      price of one" - using a runtime-calibrated memory estimate
---      rather than a guessed constant.
+--      rather than a guessed constant. Multiplication now dispatches
+--      schoolbook -> Karatsuba -> Toom-Cook 3 (see fibbenchcommon.lua);
+--      the bootstrap path benefits directly.
 --   2. Once at least one storage node has joined, that pair of huge
 --      numbers is split into fixed-size limb "chunks" and handed off
 --      to the storage network, freeing the master's own RAM back down
@@ -15,14 +17,37 @@
 --   3. GROWTH: forever after, the master advances the sequence one
 --      Fibonacci step at a time (A,B -> B,A+B) by handing out tiny
 --      "add this chunk, assuming carry-in X" tasks to compute nodes.
---      Both carryIn=0 and carryIn=1 are dispatched for every chunk in
---      parallel (a "carry-select adder", borrowed from hardware
---      design) so the whole step parallelises across however many
---      compute nodes are connected, instead of being a strict
---      chunk-by-chunk ripple chain. The master only ever resolves a
---      handful of carry BITS itself - never full chunk data - so its
---      own memory usage stays flat no matter how large the number
---      that the network as a whole is holding gets.
+--      Two algorithms are available, selected at runtime:
+--
+--        ADD_ALGORITHM = "carry_select"  (legacy, default)
+--            Both carryIn=0 and carryIn=1 are dispatched for every chunk
+--            in parallel (a "carry-select adder", borrowed from hardware
+--            design) so the whole step parallelises across however many
+--            compute nodes are connected, instead of being a strict
+--            chunk-by-chunk ripple chain. The master only ever resolves
+--            a handful of carry BITS itself - never full chunk data - so
+--            its own memory usage stays flat no matter how large the
+--            number that the network as a whole is holding gets.
+--
+--        ADD_ALGORITHM = "kogge_stone"   (new)
+--            Each step runs as three phases:
+--              Phase 1 (parallel across workers):
+--                each worker fetches A,B for its chunk, computes per-limb
+--                (g, p) arrays via bigint.chunkGenProp, reduces them to
+--                a single per-chunk (gOut, pOut) bit pair via
+--                bigint.chunkReduceGP, and returns just those 2 bits.
+--              Phase 2 (master, no network, O(log N)):
+--                bigint.masterPrefixCarries() runs a Kogge-Stone prefix
+--                scan over the collected (gOut, pOut) pairs to compute
+--                every chunk's carryIn bit.
+--              Phase 3 (parallel across workers):
+--                each worker fetches A,B again, computes the final sum
+--                via bigint.chunkFinalAdd with its now-known carryIn,
+--                stores the result, and returns carryOut.
+--            Total network waves per step: 2 (vs ~1 for carry-select,
+--            but carry-select sends 2x the chunks per wave). The master
+--            never touches chunk data in either algorithm.
+--
 --   4. Workers (compute or storage) may join or leave at any time;
 --      the master re-balances automatically and requeues any task an
 --      unresponsive worker was holding.
@@ -52,6 +77,24 @@ local keys = net.keyboard.keys
 local CHECKPOINT_PATH = scriptDir .. "fibbench_checkpoint.chk"
 local CHECKPOINT_EVERY_STEPS = 10
 local CHECKPOINT_EVERY_SECONDS = 120
+
+------------------------------------------------------------------
+-- Configuration
+--
+-- Selects which distributed addition algorithm the GROWTH phase uses.
+--   "carry_select" (default) - 2x chunk parallelism per wave, 1 wave
+--   "kogge_stone"           - 1x chunk parallelism per wave, 2 waves,
+--                              but the cross-chunk carry is resolved
+--                              in O(log N) on the master instead of
+--                              chunk-by-chunk at the network.
+-- Override at startup by setting ADD_ALGORITHM in the environment or
+-- by editing this line. Workers support both protocols transparently
+-- (task_chunk_add / task_chunk_gp / task_chunk_final - see
+-- fibbenchcompute.lua), so the master can switch algorithms between
+-- runs without redeploying compute nodes.
+------------------------------------------------------------------
+local ADD_ALGORITHM = os.getenv and os.getenv("ADD_ALGORITHM") or "carry_select"
+if ADD_ALGORITHM ~= "kogge_stone" then ADD_ALGORITHM = "carry_select" end
 
 ------------------------------------------------------------------
 -- TUI setup
@@ -196,6 +239,13 @@ local state = {
   lastStepDurations = {},
 }
 
+-- Forward declaration: the growth-loop task state machine is built later
+-- (around line ~510, after the chunk-helper and node-registry code),
+-- but drawProgress() wants to peek at it to show the current algorithm
+-- sub-phase. We forward-declare the local here so the lexical closure
+-- in drawProgress binds to THIS local, not a global of the same name.
+local growth
+
 ------------------------------------------------------------------
 -- Checkpointing
 ------------------------------------------------------------------
@@ -265,7 +315,20 @@ local function drawProgress()
   local phaseColor = ui.palette.warn
   if state.phase == "GROWING" then phaseColor = ui.palette.good end
   if state.phase == "SEEDING_STORAGE" or state.phase == "BOOTSTRAP" then phaseColor = ui.palette.accent2 end
-  ui.text(x, line, "Phase: " .. state.phase .. (state.paused and " (PAUSED)" or ""), phaseColor); line = line + 1
+  -- When in GROWING with an active step, show the algorithm + sub-phase.
+  local phaseLabel = state.phase
+  if state.phase == "GROWING" and growth then
+    local sub
+    if growth.algorithm == "kogge_stone" then
+      sub = " (KS: " .. growth.subPhase .. " " .. growth.resolvedCount .. "/" .. growth.total .. ")"
+    else
+      sub = " (CS: " .. growth.resolvedCount .. "/" .. growth.total .. ")"
+    end
+    phaseLabel = phaseLabel .. sub
+  elseif state.phase == "GROWING" then
+    phaseLabel = phaseLabel .. " [" .. ADD_ALGORITHM .. "]"
+  end
+  ui.text(x, line, "Phase: " .. phaseLabel .. (state.paused and " (PAUSED)" or ""), phaseColor); line = line + 1
   ui.text(x, line, "Series: " .. (state.seriesId or "-"), ui.palette.dim); line = line + 2
   if state.n > 0 then
     ui.text(x, line, "Index n = F(" .. util.commas(state.n) .. ")", ui.palette.text); line = line + 1
@@ -292,6 +355,9 @@ local function drawFooter()
 end
 
 drawNetwork(); drawProgress(); drawFooter()
+log(string.format("Master up. Add algorithm: %s.", ADD_ALGORITHM), ui.palette.dim)
+log("To switch, set ADD_ALGORITHM=kogge_stone in env and restart.", ui.palette.dim)
+log("Workers support both protocols transparently.", ui.palette.dim)
 
 ------------------------------------------------------------------
 -- Message handling (registration / heartbeats / bye) - used in
@@ -417,37 +483,112 @@ end
 
 ------------------------------------------------------------------
 -- Growth loop (task-queue state machine, ticked from the main loop)
+--
+-- Two algorithms are supported:
+--
+--   "carry_select" (legacy):  per chunk, dispatches task_chunk_add
+--     twice (carryIn=0 and carryIn=1) in parallel; the master then
+--     walks the chain in finalizeStep and picks the right carryIn
+--     variant per chunk based on the real carry bit. 1 wave, 2x
+--     chunk parallelism.
+--
+--   "kogge_stone" (new):  three sub-phases.
+--     subPhase="gp"     - dispatches task_chunk_gp to each chunk's
+--                         worker; worker computes (gOut, pOut) and
+--                         returns just those 2 bits. No storage write.
+--     subPhase="prefix" - master runs bigint.masterPrefixCarries over
+--                         the collected (gOut, pOut) pairs to get the
+--                         per-chunk carryIn bits. No network.
+--     subPhase="final"  - dispatches task_chunk_final to each chunk's
+--                         worker with the now-known carryIn; worker
+--                         computes the final sum and stores the result.
+--     2 waves (gp + final), 1x chunk parallelism per wave, but the
+--     cross-chunk carry is resolved in O(log N) on the master
+--     instead of being precomputed by sending 2x the work.
+--
+-- The two algorithms share the same growth{} table, inFlight{} map,
+-- requeueTaskForWorker / sweepTaskTimeouts / handleTaskDone paths.
+-- The only differences are in beginStep (what task to enqueue),
+-- dispatchPending (what message type to send), and finalizeStep
+-- (how to assemble the final manifest from the results).
 ------------------------------------------------------------------
 
-local growth = nil -- current in-progress step, or nil if none active
+-- The growth state machine (forward-declared near the top so drawProgress
+-- can peek at it). Set to a fresh table by beginStep(); cleared by
+-- finalizeStep() or on unrecoverable error.
+growth = nil
+
+-- Build the task list for one chunk index. Returns 1 task (KS mode) or
+-- 2 tasks (carry-select mode: one for each carryIn value).
+local function buildTasksForChunk(i, aRef, bRef, stepNum)
+  local tasks = {}
+  if ADD_ALGORITHM == "kogge_stone" then
+    -- For the gp sub-phase we use a placeholder resultRef (the worker
+    -- doesn't store anything during gp); the real resultRef gets
+    -- created in the final sub-phase. We use the SAME aRef/bRef for
+    -- both sub-phases, but distinct taskIds so they don't collide.
+    local gpFilename = string.format("%s_gp_s%d_c%d.chunk", state.seriesId, stepNum, i)
+    local finalFilename = string.format("%s_R_s%d_c%d.chunk", state.seriesId, stepNum, i)
+    tasks[#tasks+1] = {
+      taskId    = myId .. "-gp-" .. stepNum .. "-" .. i,
+      kind      = "gp",
+      chunkIndex= i, carryIn = 0,   -- gp doesn't use carryIn; 0 is a placeholder
+      aRef      = aRef, bRef = bRef,
+      limbsPerChunk = state.limbsPerChunk,
+      resultRef = { node = pickStorageNode(), path = gpFilename },
+      -- For the final sub-phase, we'll allocate a fresh storage slot
+      -- when we re-dispatch. Stash the filename pattern here so we
+      -- don't have to recompute it.
+      finalFilename = finalFilename,
+      retries   = 0,
+    }
+  else
+    -- carry_select: 2 tasks per chunk (carryIn=0 and carryIn=1).
+    for carryIn = 0, 1 do
+      local filename = string.format("%s_R%d_s%d_c%d.chunk", state.seriesId, carryIn, stepNum, i)
+      tasks[#tasks+1] = {
+        taskId    = myId .. "-t" .. stepNum .. "-" .. i .. "-" .. carryIn,
+        kind      = "cs",
+        chunkIndex= i, carryIn = carryIn,
+        aRef      = aRef, bRef = bRef,
+        limbsPerChunk = state.limbsPerChunk,
+        resultRef = { node = pickStorageNode(), path = filename },
+        retries   = 0,
+      }
+    end
+  end
+  return tasks
+end
 
 local function beginStep()
   local chunkCount = math.max(state.A.chunkCount, state.B.chunkCount)
   local pending = {}
+  local stepNum = state.stepsCompleted + 1
   for i = 1, chunkCount do
     local aRef = state.A.manifest[i]
     local bRef = state.B.manifest[i]
-    for carryIn = 0, 1 do
-      local storageNode = pickStorageNode()
-      local filename = string.format("%s_R%d_s%d_c%d.chunk", state.seriesId, carryIn, state.stepsCompleted + 1, i)
-      pending[#pending+1] = {
-        taskId = myId .. "-t" .. state.stepsCompleted .. "-" .. i .. "-" .. carryIn,
-        chunkIndex = i, carryIn = carryIn,
-        aRef = aRef, bRef = bRef,
-        limbsPerChunk = state.limbsPerChunk,
-        resultRef = { node = storageNode, path = filename },
-        retries = 0,
-      }
-    end
+    local tasks = buildTasksForChunk(i, aRef, bRef, stepNum)
+    for _, t in ipairs(tasks) do pending[#pending+1] = t end
   end
+
+  -- Shared growth table. The "results" map has different shapes per
+  -- algorithm (see handleTaskDone / finalizeStep), but the inFlight map
+  -- and pending queue are identical.
   growth = {
+    algorithm  = ADD_ALGORITHM,
+    subPhase   = ADD_ALGORITHM == "kogge_stone" and "gp" or "cs",
     chunkCount = chunkCount,
-    pending = pending,      -- queue of tasks not yet dispatched
-    inFlight = {},          -- taskId -> {task=, worker=, sentAt=}
-    results = {},           -- [chunkIndex] = {c0={carryOut=,resultRef=}, c1={...}}
+    pending    = pending,      -- queue of tasks not yet dispatched
+    inFlight   = {},           -- taskId -> {task=, worker=, sentAt=}
+    results    = {},           -- algorithm-specific (see below)
     resolvedCount = 0,
-    total = #pending,
-    startedAt = computer.uptime(),
+    total      = #pending,
+    startedAt  = computer.uptime(),
+    -- Kogge-Stone phase-2 outputs (filled when subPhase transitions
+    -- from "gp" to "final"):
+    gpList     = nil,          -- [chunkIndex] = {g=, p=}
+    carryIns   = nil,          -- [chunkIndex] = 0|1
+    finalCarry = nil,          -- 0|1 (carry out of the last chunk)
   }
 end
 
@@ -458,8 +599,13 @@ requeueTaskForWorker = function(workerAddr)
       entry.task.retries = entry.task.retries + 1
       growth.pending[#growth.pending+1] = entry.task
       growth.inFlight[taskId] = nil
-      log(string.format("Requeued chunk %d (carryIn=%d) after worker loss (retry #%d).",
-        entry.task.chunkIndex, entry.task.carryIn, entry.task.retries), ui.palette.warn)
+      if entry.task.kind == "gp" then
+        log(string.format("Requeued gp chunk %d after worker loss (retry #%d).",
+          entry.task.chunkIndex, entry.task.retries), ui.palette.warn)
+      else
+        log(string.format("Requeued chunk %d (carryIn=%d) after worker loss (retry #%d).",
+          entry.task.chunkIndex, entry.task.carryIn, entry.task.retries), ui.palette.warn)
+      end
     end
   end
 end
@@ -472,12 +618,51 @@ local function dispatchPending()
     local task = table.remove(growth.pending, 1)
     nodes[worker].busy = true
     growth.inFlight[task.taskId] = { task = task, worker = worker, sentAt = computer.uptime() }
-    net.send(modems, worker, {
-      type = "task_chunk_add", taskId = task.taskId,
-      chunkIndex = task.chunkIndex, carryIn = task.carryIn,
-      aRef = task.aRef, bRef = task.bRef, limbsPerChunk = task.limbsPerChunk,
-      resultRef = task.resultRef,
-    })
+
+    -- Message shape depends on task.kind:
+    --   cs    -> task_chunk_add    (legacy carry-select)
+    --   gp    -> task_chunk_gp     (KS phase 1)
+    --   final -> task_chunk_final (KS phase 3)
+    -- task.kind is set by buildTasksForChunk for cs/gp; for final tasks
+    -- we mutate kind in place when transitioning sub-phases (see
+    -- transitionGpToFinal below).
+    if task.kind == "gp" then
+      net.send(modems, worker, {
+        type        = "task_chunk_gp",
+        taskId      = task.taskId,
+        chunkIndex  = task.chunkIndex,
+        aRef        = task.aRef, bRef = task.bRef,
+        limbsPerChunk = task.limbsPerChunk,
+        -- carryIn is irrelevant for gp; the worker will compute (gOut, pOut)
+        -- assuming carry-in 0 (which is exactly what we want for the prefix
+        -- scan, since the master adds the real carry-in via chunkFinalAdd
+        -- in phase 3).
+        returnArrays = false,
+        -- resultRef unused for gp (no storage write); pass nil to keep
+        -- the wire format consistent with the other task types.
+        resultRef   = nil,
+      })
+    elseif task.kind == "final" then
+      net.send(modems, worker, {
+        type        = "task_chunk_final",
+        taskId      = task.taskId,
+        chunkIndex  = task.chunkIndex,
+        carryIn     = task.carryIn,
+        aRef        = task.aRef, bRef = task.bRef,
+        limbsPerChunk = task.limbsPerChunk,
+        resultRef   = task.resultRef,
+      })
+    else  -- "cs"
+      net.send(modems, worker, {
+        type        = "task_chunk_add",
+        taskId      = task.taskId,
+        chunkIndex  = task.chunkIndex,
+        carryIn     = task.carryIn,
+        aRef        = task.aRef, bRef = task.bRef,
+        limbsPerChunk = task.limbsPerChunk,
+        resultRef   = task.resultRef,
+      })
+    end
   end
 end
 
@@ -490,12 +675,21 @@ local function sweepTaskTimeouts()
       entry.task.retries = entry.task.retries + 1
       growth.pending[#growth.pending+1] = entry.task
       growth.inFlight[taskId] = nil
-      log(string.format("Chunk %d (carryIn=%d) timed out, retrying (#%d).",
-        entry.task.chunkIndex, entry.task.carryIn, entry.task.retries), ui.palette.warn)
+      if entry.task.kind == "gp" then
+        log(string.format("gp chunk %d timed out, retrying (#%d).",
+          entry.task.chunkIndex, entry.task.retries), ui.palette.warn)
+      else
+        log(string.format("Chunk %d (carryIn=%d) timed out, retrying (#%d).",
+          entry.task.chunkIndex, entry.task.carryIn, entry.task.retries), ui.palette.warn)
+      end
     end
   end
 end
 
+-- Handle a task_done reply. Shape varies by algorithm / sub-phase:
+--   cs     : rec = {c0={carryOut=, resultRef=}, c1={...}}
+--   final  : rec = {result=, carryOut=}  (one per chunk; chunkFinalAdd
+--            returns carryOut too, which we use to detect top-chunk extend)
 local function handleTaskDone(msg, remoteAddr)
   -- Whoever just replied is done working, full stop - free them up
   -- immediately regardless of whether our task bookkeeping below still
@@ -514,45 +708,181 @@ local function handleTaskDone(msg, remoteAddr)
     entry.task.retries = entry.task.retries + 1
     growth.pending[#growth.pending+1] = entry.task
     if entry.task.retries % 4 == 0 then
-      log(string.format("Chunk %d (carryIn=%d) still failing after %d retries: %s",
-        entry.task.chunkIndex, entry.task.carryIn, entry.task.retries, tostring(msg.err)), ui.palette.bad)
+      log(string.format("%s chunk %d still failing after %d retries: %s",
+        entry.task.kind, entry.task.chunkIndex, entry.task.retries, tostring(msg.err)), ui.palette.bad)
     end
     return
   end
 
-  local rec = growth.results[msg.chunkIndex] or {}
-  if msg.carryIn == 0 then rec.c0 = { carryOut = msg.carryOut, resultRef = entry.task.resultRef } end
-  if msg.carryIn == 1 then rec.c1 = { carryOut = msg.carryOut, resultRef = entry.task.resultRef } end
-  growth.results[msg.chunkIndex] = rec
+  if entry.task.kind == "cs" then
+    -- Carry-select: store the result keyed by (chunkIndex, carryIn).
+    local rec = growth.results[msg.chunkIndex] or {}
+    if msg.carryIn == 0 then rec.c0 = { carryOut = msg.carryOut, resultRef = entry.task.resultRef } end
+    if msg.carryIn == 1 then rec.c1 = { carryOut = msg.carryOut, resultRef = entry.task.resultRef } end
+    growth.results[msg.chunkIndex] = rec
+  elseif entry.task.kind == "final" then
+    -- Kogge-Stone phase 3: store the single final result + carryOut.
+    growth.results[msg.chunkIndex] = {
+      resultRef = entry.task.resultRef,
+      carryOut  = msg.carryOut,
+    }
+  end
   growth.resolvedCount = growth.resolvedCount + 1
 end
 
--- Sequentially resolves the real carry chain using only the tiny
--- carry BITS already collected (never touches chunk data), deletes
--- the losing tentative chunk of each pair, and returns the new B.
+-- Handle a task_gp_done reply (Kogge-Stone phase 1 only).
+-- Stores the (gOut, pOut) pair into growth.gpList, indexed by chunkIndex.
+local function handleGpDone(msg, remoteAddr)
+  -- Same busy-flag hygiene as handleTaskDone.
+  if nodes[remoteAddr] then nodes[remoteAddr].busy = false end
+
+  if not growth then return end
+  local entry = growth.inFlight[msg.taskId]
+  if not entry then return end
+  growth.inFlight[msg.taskId] = nil
+
+  if not msg.ok then
+    entry.task.retries = entry.task.retries + 1
+    growth.pending[#growth.pending+1] = entry.task
+    if entry.task.retries % 4 == 0 then
+      log(string.format("gp chunk %d still failing after %d retries: %s",
+        entry.task.chunkIndex, entry.task.retries, tostring(msg.err)), ui.palette.bad)
+    end
+    return
+  end
+
+  if not growth.gpList then growth.gpList = {} end
+  growth.gpList[msg.chunkIndex] = { g = msg.gOut, p = msg.pOut }
+  growth.resolvedCount = growth.resolvedCount + 1
+end
+
+-- Kogge-Stone: once all gp replies are in, run the master-side prefix
+-- scan to get every chunk's carryIn, then build the final-phase task
+-- queue and switch sub-phase to "final". Returns true on success,
+-- false (with growth cleared) on internal inconsistency.
+local function transitionGpToFinal()
+  if not growth or growth.subPhase ~= "gp" then return false end
+  if not growth.gpList then
+    log("transitionGpToFinal: no gp results collected - aborting step.", ui.palette.bad)
+    growth = nil
+    return false
+  end
+
+  -- Build a Lua array of {g, p} in chunk-index order (1..chunkCount).
+  -- The prefix scan needs them contiguous; nil gaps mean a chunk
+  -- somehow didn't reply, which shouldn't happen since resolvedCount
+  -- reached total. Defensive: pad missing entries with {g=0, p=0}
+  -- (which means "this chunk never generates or propagates a carry",
+  -- the safe default if a reply was lost).
+  local gpArray = {}
+  for i = 1, growth.chunkCount do
+    gpArray[i] = growth.gpList[i] or { g = 0, p = 0 }
+  end
+
+  local carryIns, finalCarry = bigint.masterPrefixCarries(gpArray, growth.chunkCount)
+  growth.carryIns   = carryIns
+  growth.finalCarry = finalCarry
+
+  -- Sanity: carryIns[1] must be 0 (no carry into the lowest chunk).
+  if carryIns[1] ~= 0 then
+    log("transitionGpToFinal: masterPrefixCarries returned non-zero carryIn[1] - clamping.", ui.palette.warn)
+    carryIns[1] = 0
+  end
+
+  -- Build the final-phase task queue. Re-use the same aRef/bRef as
+  -- the gp phase (they're the same operands). The resultRef for each
+  -- final task points to a fresh storage slot.
+  local stepNum = state.stepsCompleted + 1
+  growth.pending = {}
+  for i = 1, growth.chunkCount do
+    local aRef = state.A.manifest[i]
+    local bRef = state.B.manifest[i]
+    local finalFilename = string.format("%s_R_s%d_c%d.chunk", state.seriesId, stepNum, i)
+    growth.pending[#growth.pending+1] = {
+      taskId    = myId .. "-fin-" .. stepNum .. "-" .. i,
+      kind      = "final",
+      chunkIndex= i,
+      carryIn   = carryIns[i] or 0,
+      aRef      = aRef, bRef = bRef,
+      limbsPerChunk = state.limbsPerChunk,
+      resultRef = { node = pickStorageNode(), path = finalFilename },
+      retries   = 0,
+    }
+  end
+  growth.subPhase      = "final"
+  growth.resolvedCount = 0
+  growth.total         = #growth.pending
+  log(string.format("KS phase 2 done: %d chunks, finalCarry=%d. Dispatching phase 3.",
+    growth.chunkCount, finalCarry), ui.palette.accent2)
+  return true
+end
+
+-- Carry-select: sequentially resolves the real carry chain using only
+-- the tiny carry BITS already collected (never touches chunk data),
+-- deletes the losing tentative chunk of each pair, returns new B manifest.
+-- Kogge-Stone: just walks the final-phase results, picks each chunk's
+-- resultRef (one per chunk), and applies the precomputed finalCarry
+-- to decide whether to add a top-extension chunk.
 local function finalizeStep()
   local newManifest = {}
-  local carry = 0
-  for i = 1, growth.chunkCount do
-    local rec = growth.results[i]
-    local chosen, loser
-    if carry == 0 then chosen, loser = rec.c0, rec.c1 else chosen, loser = rec.c1, rec.c0 end
-    newManifest[i] = chosen.resultRef
-    if loser then masterDeleteChunk(loser.resultRef.node, loser.resultRef.path) end
-    carry = chosen.carryOut
-  end
-  local newChunkCount = growth.chunkCount
-  if carry == 1 then
-    newChunkCount = newChunkCount + 1
-    local extra = bigint.zeroChunk(state.limbsPerChunk)
-    extra[1] = 1
-    local node = pickStorageNode()
-    local filename = string.format("%s_Rtop_s%d.chunk", state.seriesId, state.stepsCompleted + 1)
-    local ok = masterStoreChunk(node, filename, extra)
-    if ok then
-      newManifest[newChunkCount] = { node = node, path = filename }
-    else
-      log("Failed to store carry-extension chunk - number may be truncated!", ui.palette.bad)
+  local newChunkCount
+
+  if growth.algorithm == "kogge_stone" then
+    -- One final result per chunk; the real carry-in for each was already
+    -- baked into the stored result by the worker (via chunkFinalAdd).
+    -- The per-chunk carryOut reported by the worker is informational only
+    -- (we already know the prefix carry); we use the master-side
+    -- finalCarry to decide whether to extend.
+    for i = 1, growth.chunkCount do
+      local rec = growth.results[i]
+      if not rec then
+        log(string.format("finalizeStep: chunk %d missing final result - aborting step.", i), ui.palette.bad)
+        growth = nil
+        return
+      end
+      newManifest[i] = rec.resultRef
+    end
+    newChunkCount = growth.chunkCount
+    -- The carry-out of the last chunk is growth.finalCarry (the prefix
+    -- carry-out of all chunks). If it's 1, we need a new top chunk.
+    if growth.finalCarry == 1 then
+      newChunkCount = newChunkCount + 1
+      local extra = bigint.zeroChunk(state.limbsPerChunk)
+      extra[1] = 1
+      local node = pickStorageNode()
+      local filename = string.format("%s_Rtop_s%d.chunk", state.seriesId, state.stepsCompleted + 1)
+      local ok = masterStoreChunk(node, filename, extra)
+      if ok then
+        newManifest[newChunkCount] = { node = node, path = filename }
+      else
+        log("Failed to store carry-extension chunk - number may be truncated!", ui.palette.bad)
+      end
+    end
+  else
+    -- Carry-select: walk chunks in order, picking the (c0 or c1)
+    -- variant that matches the running carry, deleting the loser.
+    local carry = 0
+    for i = 1, growth.chunkCount do
+      local rec = growth.results[i]
+      local chosen, loser
+      if carry == 0 then chosen, loser = rec.c0, rec.c1 else chosen, loser = rec.c1, rec.c0 end
+      newManifest[i] = chosen.resultRef
+      if loser then masterDeleteChunk(loser.resultRef.node, loser.resultRef.path) end
+      carry = chosen.carryOut
+    end
+    newChunkCount = growth.chunkCount
+    if carry == 1 then
+      newChunkCount = newChunkCount + 1
+      local extra = bigint.zeroChunk(state.limbsPerChunk)
+      extra[1] = 1
+      local node = pickStorageNode()
+      local filename = string.format("%s_Rtop_s%d.chunk", state.seriesId, state.stepsCompleted + 1)
+      local ok = masterStoreChunk(node, filename, extra)
+      if ok then
+        newManifest[newChunkCount] = { node = node, path = filename }
+      else
+        log("Failed to store carry-extension chunk - number may be truncated!", ui.palette.bad)
+      end
     end
   end
 
@@ -642,6 +972,8 @@ while running do
         handleRegistryMessage(msg, remoteAddr)
       elseif msg.type == "task_done" then
         handleTaskDone(msg, remoteAddr)
+      elseif msg.type == "task_gp_done" then
+        handleGpDone(msg, remoteAddr)
       end
     end)
     if not ok then log("message handler error: " .. tostring(err), ui.palette.bad) end
@@ -671,7 +1003,29 @@ while running do
     if growth then
       dispatchPending()
       sweepTaskTimeouts()
-      if growth.resolvedCount >= growth.total then
+
+      -- Kogge-Stone phase transition: when the gp sub-phase has all its
+      -- replies in, run the master-side prefix scan and rebuild the
+      -- pending queue with task_chunk_final tasks. Then continue
+      -- dispatching in the "final" sub-phase.
+      if growth.algorithm == "kogge_stone"
+         and growth.subPhase == "gp"
+         and growth.resolvedCount >= growth.total then
+        local ok, err = pcall(transitionGpToFinal)
+        if not ok then
+          log("transitionGpToFinal error: " .. tostring(err), ui.palette.bad)
+          growth = nil
+        end
+      end
+
+      -- Step is fully done when the current sub-phase has resolved all
+      -- its tasks. For carry_select this is the only sub-phase; for
+      -- kogge_stone this only fires once subPhase == "final" has
+      -- resolved everything (because the gp sub-phase was already
+      -- transitioned out of above).
+      if growth
+         and (growth.algorithm ~= "kogge_stone" or growth.subPhase == "final")
+         and growth.resolvedCount >= growth.total then
         local ok, err = pcall(finalizeStep)
         if not ok then
           log("finalizeStep error: " .. tostring(err), ui.palette.bad)

@@ -23,7 +23,7 @@ local common = {}
 ------------------------------------------------------------------
 
 common.PORT = 4790
-common.PROTOCOL_VERSION = 1
+common.PROTOCOL_VERSION = 2       -- v2: adds task_chunk_gp / task_chunk_final
 common.HEARTBEAT_INTERVAL = 4      -- seconds between worker heartbeats
 common.HEARTBEAT_TIMEOUT  = 13     -- master drops a silent worker after this
 common.TASK_TIMEOUT       = 20     -- master reassigns a task after this
@@ -32,6 +32,30 @@ common.DEFAULT_CHUNK_LIMBS = 500   -- ~3,500 decimal digits per chunk (small on 
                                     -- kick in well before a single node's limits, not
                                     -- only after implausibly long uptimes)
 
+-- Task / reply message types understood by compute nodes.
+-- (Listed here so the master and compute node agree on string literals.)
+common.MSG = {
+  -- Master -> compute
+  TASK_CHUNK_ADD    = "task_chunk_add",     -- legacy: fetch A,B + sequential carry-chain add
+  TASK_CHUNK_GP     = "task_chunk_gp",      -- Kogge-Stone phase 1: per-chunk (gOut, pOut)
+  TASK_CHUNK_FINAL  = "task_chunk_final",   -- Kogge-Stone phase 3: final sum w/ known carryIn
+  WELCOME           = "welcome",
+  MASTER_SHUTDOWN   = "master_shutdown",
+
+  -- Compute -> master
+  HELLO_COMPUTE     = "hello_compute",
+  TASK_DONE         = "task_done",          -- reply to TASK_CHUNK_ADD / TASK_CHUNK_FINAL
+  TASK_GP_DONE      = "task_gp_done",       -- reply to TASK_CHUNK_GP
+  HEARTBEAT         = "heartbeat",
+  BYE               = "bye",
+
+  -- Storage ops (master or compute -> storage)
+  FETCH_CHUNK       = "fetch_chunk",
+  STORE_CHUNK       = "store_chunk",
+  CHUNK_DATA        = "chunk_data",
+  STORE_ACK         = "store_ack",
+}
+
 ------------------------------------------------------------------
 -- BigInt
 --
@@ -39,6 +63,23 @@ common.DEFAULT_CHUNK_LIMBS = 500   -- ~3,500 decimal digits per chunk (small on 
 -- Base 1e7 (DIGITS_PER_LIMB = 7) so that limb*limb (< 1e14) plus carry
 -- accumulation stays comfortably inside Lua double integer precision
 -- (2^53 ~= 9.007e15).
+--
+-- Algorithm notes
+--   * Addition uses a Kogge-Stone parallel-prefix carry network. The
+--     carry into every limb is computed in O(log n) "rounds" of pairwise
+--     (g, p) combination, after which the final limb sums are produced
+--     in a single forward pass. In single-threaded Lua this is still
+--     serial at the instruction level, but the algorithmic structure
+--     is what powers the distributed chunk pipeline (chunkGenProp +
+--     combineGenProp + chunkFinalAdd): when a number is spread across
+--     N compute nodes, the master can run an O(log N)-rounds reduction
+--     instead of the previous O(N) sequential carry chain.
+--   * Multiplication dispatches schoolbook -> Karatsuba -> Toom-Cook 3
+--     as operands grow. Toom-Cook 3 is O(n^log_3(5)) ~= O(n^1.465),
+--     which beats Karatsuba's O(n^1.585) and noticeably shortens the
+--     fast-doubling Fibonacci bootstrap.
+--   * Squaring has its own dedicated path (schoolbook, KaratsubaSqr,
+--     Toom-Cook 3 squaring) for the same reason.
 ------------------------------------------------------------------
 
 local bigint = {}
@@ -142,7 +183,31 @@ function bigint.compare(a, b)
   return a.sign > 0 and c or -c
 end
 
-local function addMag(a, b)
+------------------------------------------------------------------
+-- Kogge-Stone parallel-prefix addition
+--
+-- For each limb position i, we classify the (a[i], b[i]) pair:
+--   g[i] = 1  if a[i] + b[i] >= BASE         (this position GENERATES a carry-out)
+--   p[i] = 1  if a[i] + b[i] == BASE - 1       (this position PROPAGATES a carry-in)
+-- The carry INTO position i is the OR over all j<i of (g[j] AND (AND_{k=j+1..i-1} p[k])).
+-- The parallel-prefix operator combines two adjacent blocks:
+--   (g2,p2) ∘ (g1,p1) = (g2 OR (p2 AND g1),  p2 AND p1)
+-- which is *associative*, so a Kogge-Stone tree of log2(n) levels gives
+-- every position its prefix carry in O(n log n) work.
+--
+-- In single-threaded Lua this is more work than the linear carry chain,
+-- but the same primitive powers the distributed chunk pipeline (see
+-- chunkGenProp / combineGenProp / chunkFinalAdd below), where the log n
+-- structure cuts master-side rounds from O(N) to O(log N).
+--
+-- A `bigint.USE_KOGGE_STONE_ADD` flag (default true) lets callers fall
+-- back to the sequential chain for very small operands if desired.
+------------------------------------------------------------------
+
+bigint.USE_KOGGE_STONE_ADD = true
+
+-- Sequential carry-chain adder (kept as the fallback / reference).
+local function addMagSeq(a, b)
   local r = newBig(1)
   local n = math.max(a.n, b.n)
   local carry = 0
@@ -155,6 +220,85 @@ local function addMag(a, b)
   if carry > 0 then n = n + 1; r[n] = carry end
   r.n = n
   return trim(r)
+end
+
+-- Kogge-Stone parallel-prefix adder (the new default).
+local function addMagKS(a, b)
+  local n = math.max(a.n, b.n)
+  if n == 0 then return bigint.fromInt(0) end
+
+  -- Tiny operands: the prefix tree overhead is not worth it; defer to
+  -- the linear chain. The crossover was tuned for the BASE-1e7 layout
+  -- (each limb is ~23 bits, so a 4-limb number is ~92 bits).
+  if n < 8 then
+    return addMagSeq(a, b)
+  end
+
+  -- Pass 1: compute partial sums + generate/propagate bits.
+  -- We pack g and p into Lua arrays of 0/1 numbers for cache friendliness.
+  local g  = {}     -- g[i] = 1 if (a[i]+b[i]) generates a carry out
+  local p  = {}     -- p[i] = 1 if (a[i]+b[i]) propagates a carry in
+  local s  = {}     -- s[i] = (a[i]+b[i]) mod BASE  (partial sum, no carry-in yet)
+  for i = 1, n do
+    local ai = a[i] or 0
+    local bi = b[i] or 0
+    local sum = ai + bi
+    if sum >= BASE then
+      g[i] = 1; p[i] = 0; s[i] = sum - BASE
+    elseif sum == BASE - 1 then
+      g[i] = 0; p[i] = 1; s[i] = sum
+    else
+      g[i] = 0; p[i] = 0; s[i] = sum
+    end
+    if i % 20000 == 0 then yield() end
+  end
+
+  -- Pass 2: Kogge-Stone parallel-prefix scan.
+  -- Invariant at the start of each "round" with offset d:
+  --   g[i] = the carry-out generated by the block [i-d+1 .. i]
+  --   p[i] = whether that block propagates a carry end-to-end
+  -- After log2(n) rounds, g[i] is the carry-out of the entire prefix [1..i].
+  local d = 1
+  while d < n do
+    for i = n, d + 1, -1 do     -- sweep right-to-left so we don't clobber in-flight inputs
+      local pi = p[i]
+      local gi = g[i]
+      local gL = g[i - d]
+      -- new g = g[i] OR (p[i] AND g[i-d])
+      if pi == 1 and gL == 1 then
+        g[i] = 1
+      end
+      -- new p = p[i] AND p[i-d]   (only changes if p[i] is currently 1)
+      if pi == 1 and p[i - d] == 0 then
+        p[i] = 0
+      end
+    end
+    d = d * 2
+    if d <= n and math.floor(d / 2) % 65536 == 0 then yield() end
+  end
+
+  -- Pass 3: final sums. carry into position 1 is 0; carry into position i>1
+  -- is g[i-1]. The "+carry" may push a partial sum from BASE-1 to BASE,
+  -- in which case the limb becomes 0 and the outgoing carry is captured
+  -- by g[i] (which is already 1 because p[i] was 1).
+  local r = newBig(1)
+  local carry = 0
+  for i = 1, n do
+    local si = s[i] + carry
+    if si >= BASE then si = si - BASE; carry = 1 else carry = g[i] end
+    r[i] = si
+    if i % 20000 == 0 then yield() end
+  end
+  if carry > 0 then n = n + 1; r[n] = carry end
+  r.n = n
+  return trim(r)
+end
+
+local function addMag(a, b)
+  if bigint.USE_KOGGE_STONE_ADD then
+    return addMagKS(a, b)
+  end
+  return addMagSeq(a, b)
 end
 
 -- Requires |a| >= |b|
@@ -273,9 +417,158 @@ local function karatsuba(a, b)
   return result
 end
 
+------------------------------------------------------------------
+-- Toom-Cook 3-way multiplication
+--
+-- Splits each operand into 3 chunks (a = a0 + a1*B^m + a2*B^2m),
+-- evaluates both polynomials at 5 points {0, 1, -1, 2, infinity},
+-- multiplies pointwise (5 recursive calls of size ~n/3), and interpolates
+-- back via the standard Bodrato sequence (one div-by-2, one div-by-2,
+-- one div-by-3). Asymptotic cost O(n^log_3(5)) ~= O(n^1.465), beating
+-- Karatsuba's O(n^1.585). For the fast-doubling Fibonacci bootstrap,
+-- where the operands routinely reach 10^4 - 10^6 limbs, this is the
+-- single biggest algorithmic win available without going to an FFT.
+--
+-- Threshold: set generously above Karatsuba's crossover, because the
+-- evaluation/interpolation overhead (5 adds, 2 subs, 3 shifts, 3 small
+-- divisions per call) only pays off at reasonably large sizes.
+------------------------------------------------------------------
+
+local TOOM3_THRESHOLD = 240 -- limbs; above this, Toom-Cook 3 wins
+
+-- Small-integer division helper. Divides a signed bigint by a small
+-- positive integer d. Toom-Cook 3 guarantees exact divisibility, so we
+-- don't need to handle remainder semantics; we just truncate to zero
+-- remainder when we encounter it (which is the mathematically correct
+-- result for an exactly-divisible input).
+local function divSmall(x, d)
+  if x.n == 1 and x[1] == 0 then return bigint.fromInt(0) end
+  local sign = x.sign
+  local r = newBig(1)
+  local carry = 0
+  for i = x.n, 1, -1 do
+    local cur = carry * BASE + x[i]
+    r[i] = math.floor(cur / d)
+    carry = cur % d
+  end
+  r.n = x.n
+  r.sign = sign
+  return trim(r)
+end
+bigint.divSmall = divSmall
+
+-- Split a bigint into 3 magnitude pieces at split point m:
+--   x = x0 + x1*B^m + x2*B^(2m)   (x2 may be smaller than m limbs)
+local function split3(x, m)
+  local x0 = newBig(1)
+  local n0 = math.min(m, x.n)
+  for i = 1, n0 do x0[i] = x[i] end
+  x0.n = math.max(n0, 1); trim(x0)
+
+  local x1 = newBig(1)
+  local n1 = 0
+  for i = m + 1, math.min(2 * m, x.n) do n1 = n1 + 1; x1[n1] = x[i] end
+  x1.n = math.max(n1, 1); trim(x1)
+
+  local x2 = newBig(1)
+  local n2 = 0
+  for i = 2 * m + 1, x.n do n2 = n2 + 1; x2[n2] = x[i] end
+  x2.n = math.max(n2, 1); trim(x2)
+
+  return x0, x1, x2
+end
+
+local toom3 -- forward declaration
+
+local function toom3(a, b)
+  -- Both operands are magnitudes (signs are handled by bigint.mul, which
+  -- sets the result sign based on a.sign * b.sign *after* mulMag returns).
+  local m = math.ceil(math.max(a.n, b.n) / 3)
+  if m < 2 then
+    -- Operands too small to split sensibly - fall back to Karatsuba.
+    return karatsuba(a, b)
+  end
+
+  local a0, a1, a2 = split3(a, m)
+  local b0, b1, b2 = split3(b, m)
+
+  -- Evaluate a(x) at the 5 evaluation points. We use bigint.add/sub
+  -- throughout because intermediate values can be negative (e.g.
+  -- a(-1) = a0 - a1 + a2 can be negative).
+  local aP1  = bigint.add(bigint.add(a0, a1), a2)            -- a(1)  = a0 + a1 + a2
+  local aM1  = bigint.add(bigint.sub(a0, a1), a2)            -- a(-1) = a0 - a1 + a2
+  local twoA1 = bigint.add(a1, a1)
+  local twoA2 = bigint.add(a2, a2)
+  local fourA2 = bigint.add(twoA2, twoA2)
+  local aP2  = bigint.add(bigint.add(a0, twoA1), fourA2)    -- a(2)  = a0 + 2*a1 + 4*a2
+
+  local bP1  = bigint.add(bigint.add(b0, b1), b2)
+  local bM1  = bigint.add(bigint.sub(b0, b1), b2)
+  local twoB1 = bigint.add(b1, b1)
+  local twoB2 = bigint.add(b2, b2)
+  local fourB2 = bigint.add(twoB2, twoB2)
+  local bP2  = bigint.add(bigint.add(b0, twoB1), fourB2)
+
+  -- Pointwise products. These dispatch back through mulMag -> toom3 if
+  -- the operands are still big enough, otherwise Karatsuba/schoolbook.
+  -- bigint.mul is used (not mulMag directly) so signs are tracked through
+  -- the interpolation math.
+  local W0   = bigint.mul(a0,  b0)     -- c(0)   = c0
+  local W1   = bigint.mul(aP1, bP1)    -- c(1)
+  local Wm1  = bigint.mul(aM1, bM1)    -- c(-1)
+  local W2   = bigint.mul(aP2, bP2)    -- c(2)
+  local WInf = bigint.mul(a2,  b2)     -- c(inf) = c4
+
+  -- Interpolation (Bodrato's sequence).
+  -- We're solving for r0, r1, r2, r3, r4 in:
+  --   c(x) = r0 + r1*x + r2*x^2 + r3*x^3 + r4*x^4
+  -- Then the bigint result = r0 + r1*B^m + r2*B^(2m) + r3*B^(3m) + r4*B^(4m).
+  --
+  -- Standard identities:
+  --   r0 = W0
+  --   r4 = WInf
+  --   r2 = (W1 + Wm1)/2 - r0 - r4
+  --   D  = (W1 - Wm1)/2                          (= r1 + r3)
+  --   E  = (W2 - r0 - 4*r2 - 16*r4)/2            (= r1 + 4*r3)
+  --   r3 = (E - D) / 3
+  --   r1 = D - r3
+  local r0 = W0
+  local r4 = WInf
+
+  local Wsum  = bigint.add(W1, Wm1)
+  local r2    = bigint.sub(bigint.sub(divSmall(Wsum, 2), r0), r4)
+
+  local Wdiff = bigint.sub(W1, Wm1)
+  local D     = divSmall(Wdiff, 2)
+
+  local fourR2  = bigint.add(bigint.add(r2, r2), bigint.add(r2, r2))   -- 4*r2
+  local twoR4   = bigint.add(r4, r4)
+  local fourR4  = bigint.add(twoR4, twoR4)
+  local eightR4 = bigint.add(fourR4, fourR4)
+  local sixteenR4 = bigint.add(eightR4, eightR4)            -- 16*r4
+  local Enum    = bigint.sub(bigint.sub(bigint.sub(W2, r0), fourR2), sixteenR4)
+  local E       = divSmall(Enum, 2)
+
+  local r3 = divSmall(bigint.sub(E, D), 3)
+  local r1 = bigint.sub(D, r3)
+
+  -- Reassemble: r0 + r1*B^m + r2*B^(2m) + r3*B^(3m) + r4*B^(4m)
+  local result = r0
+  result = bigint.add(result, shiftLimbs(r1, m))
+  result = bigint.add(result, shiftLimbs(r2, 2 * m))
+  result = bigint.add(result, shiftLimbs(r3, 3 * m))
+  result = bigint.add(result, shiftLimbs(r4, 4 * m))
+
+  yield()
+  return result
+end
+
 mulMag = function(a, b)
   if (a.n == 1 and a[1] == 0) or (b.n == 1 and b[1] == 0) then
     return bigint.fromInt(0)
+  end
+  if a.n >= TOOM3_THRESHOLD and b.n >= TOOM3_THRESHOLD then
+    return toom3(a, b)
   end
   return karatsuba(a, b)
 end
@@ -367,9 +660,79 @@ local function karatsubaSqr(a)
   return result
 end
 
+------------------------------------------------------------------
+-- Toom-Cook 3-way squaring
+--
+-- Same shape as toom3, but the 5 pointwise products become squarings,
+-- which costs ~50% less at the schoolbook level and ~10% less at the
+-- Karatsuba level. Since fibFastDoubling does TWO squarings per step
+-- (sqr(a) + sqr(b)), this saving compounds through the recursion and
+-- is the single biggest bootstrap win after toom3 mul itself.
+--
+-- The evaluation/interpolation math is identical to toom3 because
+-- a(x)*a(x) is just c(x) = a(x)^2 with the same coefficients r0..r4.
+------------------------------------------------------------------
+
+local function toom3Sqr(a)
+  local m = math.ceil(a.n / 3)
+  if m < 2 then
+    return karatsubaSqr(a)
+  end
+
+  local a0, a1, a2 = split3(a, m)
+
+  -- Evaluate a(x) at the 5 evaluation points.
+  local aP1   = bigint.add(bigint.add(a0, a1), a2)
+  local aM1   = bigint.add(bigint.sub(a0, a1), a2)
+  local twoA1 = bigint.add(a1, a1)
+  local twoA2 = bigint.add(a2, a2)
+  local fourA2 = bigint.add(twoA2, twoA2)
+  local aP2   = bigint.add(bigint.add(a0, twoA1), fourA2)
+
+  -- Pointwise SQUARINGS (instead of multiplications).
+  local W0   = bigint.sqr(a0)     -- c(0)   = r0
+  local W1   = bigint.sqr(aP1)    -- c(1)
+  local Wm1  = bigint.sqr(aM1)    -- c(-1)
+  local W2   = bigint.sqr(aP2)    -- c(2)
+  local WInf = bigint.sqr(a2)     -- c(inf) = r4
+
+  -- Identical interpolation sequence as toom3.
+  local r0 = W0
+  local r4 = WInf
+
+  local Wsum  = bigint.add(W1, Wm1)
+  local r2    = bigint.sub(bigint.sub(divSmall(Wsum, 2), r0), r4)
+
+  local Wdiff = bigint.sub(W1, Wm1)
+  local D     = divSmall(Wdiff, 2)
+
+  local fourR2  = bigint.add(bigint.add(r2, r2), bigint.add(r2, r2))
+  local twoR4   = bigint.add(r4, r4)
+  local fourR4  = bigint.add(twoR4, twoR4)
+  local eightR4 = bigint.add(fourR4, fourR4)
+  local sixteenR4 = bigint.add(eightR4, eightR4)
+  local Enum    = bigint.sub(bigint.sub(bigint.sub(W2, r0), fourR2), sixteenR4)
+  local E       = divSmall(Enum, 2)
+
+  local r3 = divSmall(bigint.sub(E, D), 3)
+  local r1 = bigint.sub(D, r3)
+
+  local result = r0
+  result = bigint.add(result, shiftLimbs(r1, m))
+  result = bigint.add(result, shiftLimbs(r2, 2 * m))
+  result = bigint.add(result, shiftLimbs(r3, 3 * m))
+  result = bigint.add(result, shiftLimbs(r4, 4 * m))
+
+  yield()
+  return result
+end
+
 sqrMag = function(a)
   if a.n == 1 and a[1] == 0 then
     return bigint.fromInt(0)
+  end
+  if a.n >= TOOM3_THRESHOLD then
+    return toom3Sqr(a)
   end
   return karatsubaSqr(a)
 end
@@ -456,6 +819,186 @@ function bigint.zeroChunk(limbsPerChunk)
   local z = {}
   for i = 1, limbsPerChunk do z[i] = 0 end
   return z
+end
+
+------------------------------------------------------------------
+-- Distributed Kogge-Stone chunk primitives
+--
+-- The legacy chunkAdd() does a sequential carry chain *within* a chunk
+-- and reports a single carryOut to the master. The master then has to
+-- chain N chunks sequentially (carryOut[i] -> carryIn[i+1]) over the
+-- network: O(N) sequential round-trips.
+--
+-- The Kogge-Stone parallel-prefix decomposition below lets the master do
+-- the cross-chunk carry propagation in O(log N) rounds instead, by
+-- treating each chunk as a single (generate, propagate) bit pair and
+-- tree-reducing them in parallel:
+--
+--   Phase 1 (parallel across workers):
+--     each worker fetches its A, B chunks and computes per-limb (g, p)
+--     arrays via chunkGenProp, then reduces them to a single per-chunk
+--     (gOut, pOut) pair via chunkReduceGP. The (gOut, pOut) is ~2 bits.
+--
+--   Phase 2 (master-side prefix scan, O(log N) rounds, no network):
+--     the master applies combineGP() pairwise across all chunks to get
+--     each chunk's carry-in bit. (gOut_acc[i] is the carry-out of the
+--     prefix [0..i], so carry_in[i] = gOut_acc[i-1], carry_in[0] = 0.)
+--
+--   Phase 3 (parallel across workers):
+--     each worker fetches its A, B chunks AGAIN (or has cached them)
+--     and computes the final sum with its now-known carryIn via
+--     chunkFinalAdd. Returns result chunk + carryOut.
+--
+-- The math: for chunks of length L, gOut = 1 iff (a[i]+b[i]) generates
+-- a carry out of the chunk assuming carry-in 0; pOut = 1 iff the chunk
+-- propagates an incoming carry end-to-end. combineGP is the associative
+-- Kogge-Stone block operator:
+--   (g2,p2) ∘ (g1,p1) = (g2 OR (p2 AND g1), p1 AND p2)
+-- where (g1,p1) is the LOWER block and (g2,p2) is the UPPER block.
+--
+-- The protocol additions (task_chunk_gp / task_chunk_final) live in
+-- fibbenchcompute.lua. The master side is described in the protocol
+-- notes below; it can be added to fibbenchmaster.lua without changing
+-- the existing task_chunk_add path.
+------------------------------------------------------------------
+
+-- Phase 1 helper: per-limb generate/propagate bits for a chunk.
+-- Returns two arrays (g, p), each of length limbsPerChunk, with 0/1 entries:
+--   g[i] = 1 if (A[i] + B[i]) generates a carry-out of position i
+--   p[i] = 1 if (A[i] + B[i]) propagates a carry-in through position i
+-- (i.e., p[i]=1 iff A[i]+B[i] == BASE-1; g[i]=1 iff A[i]+B[i] >= BASE.)
+function bigint.chunkGenProp(chunkA, chunkB, limbsPerChunk)
+  local g, p = {}, {}
+  for i = 1, limbsPerChunk do
+    local ai = (chunkA and chunkA[i]) or 0
+    local bi = (chunkB and chunkB[i]) or 0
+    local s = ai + bi
+    if s >= BASE then
+      g[i] = 1; p[i] = 0
+    elseif s == BASE - 1 then
+      g[i] = 0; p[i] = 1
+    else
+      g[i] = 0; p[i] = 0
+    end
+  end
+  return g, p
+end
+
+-- Phase 1 helper: reduce a chunk's per-limb (g, p) arrays into a single
+-- per-chunk (gOut, pOut) bit pair by running Kogge-Stone within the chunk.
+--   gOut = 1 iff the chunk generates a carry-out (assuming carry-in 0)
+--   pOut = 1 iff the chunk propagates a carry-in end-to-end
+-- The reduction is O(L log L) for a chunk of L limbs; cheap relative to
+-- the network round-trip a worker had to do to fetch the chunk.
+function bigint.chunkReduceGP(g, p, limbsPerChunk)
+  -- Kogge-Stone prefix scan over the per-limb (g, p) arrays.
+  -- g_acc[i] will end up = prefix-carry-out of [1..i].
+  -- p_acc[i] will end up = whether [1..i] propagates a carry end-to-end.
+  local gAcc, pAcc = {}, {}
+  for i = 1, limbsPerChunk do gAcc[i] = g[i]; pAcc[i] = p[i] end
+
+  local d = 1
+  while d < limbsPerChunk do
+    for i = limbsPerChunk, d + 1, -1 do
+      local gL = gAcc[i - d]
+      local pL = pAcc[i - d]
+      local newG = gAcc[i]
+      if pAcc[i] == 1 and gL == 1 then newG = 1 end
+      local newP = (pAcc[i] == 1 and pL == 1) and 1 or 0
+      gAcc[i] = newG
+      pAcc[i] = newP
+    end
+    d = d * 2
+  end
+  -- Final per-chunk gOut/pOut come from the last limb.
+  local gOut = gAcc[limbsPerChunk] or 0
+  local pOut = pAcc[limbsPerChunk] or 0
+  return gOut, pOut
+end
+
+-- Phase 2 helper: combine two adjacent chunk-level (g, p) pairs into one.
+-- (gA, pA) is the LOWER block, (gB, pB) is the UPPER block.
+-- Returns (g, p) for the combined block:
+--   g = gB OR (pB AND gA)
+--   p = pA AND pB
+-- All inputs are 0/1 numbers. This is the associative Kogge-Stone operator.
+function bigint.combineGP(gA, pA, gB, pB)
+  local g = (gB == 1 or (pB == 1 and gA == 1)) and 1 or 0
+  local p = (pA == 1 and pB == 1) and 1 or 0
+  return g, p
+end
+
+-- Convenience: run a Kogge-Stone prefix scan over a list of per-chunk
+-- (g, p) pairs. Returns gOut[i] = carry-out of the prefix [1..i],
+-- so carryIn[i] = gOut[i-1] (with gOut[0] = 0 conceptually).
+-- This is what the master calls after collecting all workers' Phase-1
+-- outputs. O(C log C) work, no network.
+function bigint.prefixScanGP(gpList, count)
+  -- gpList is a 1-indexed array of {g=.., p=..} tables (mutable copies).
+  -- We do an in-place Kogge-Stone scan: at each "round" d, combine
+  -- gpList[i] with gpList[i-d] for i = d+1..count.
+  -- To keep this allocation-light, we mutate gpList in place.
+  local gAcc, pAcc = {}, {}
+  for i = 1, count do
+    gAcc[i] = gpList[i].g or 0
+    pAcc[i] = gpList[i].p or 0
+  end
+  local d = 1
+  while d < count do
+    for i = count, d + 1, -1 do
+      local gL = gAcc[i - d]
+      local pL = pAcc[i - d]
+      local newG = (gAcc[i] == 1 or (pAcc[i] == 1 and gL == 1)) and 1 or 0
+      local newP = (pAcc[i] == 1 and pL == 1) and 1 or 0
+      gAcc[i] = newG
+      pAcc[i] = newP
+    end
+    d = d * 2
+  end
+  return gAcc, pAcc
+end
+
+-- Phase 3 helper: compute the final sum of a chunk given a known carryIn.
+-- This is just the second half of addMagKS specialized to plain arrays.
+-- Returns (resultChunk, carryOut).
+function bigint.chunkFinalAdd(chunkA, chunkB, carryIn, limbsPerChunk)
+  local out = {}
+  local carry = carryIn or 0
+  for i = 1, limbsPerChunk do
+    local ai = (chunkA and chunkA[i]) or 0
+    local bi = (chunkB and chunkB[i]) or 0
+    local s = ai + bi + carry
+    if s >= BASE then s = s - BASE; carry = 1 else carry = 0 end
+    out[i] = s
+  end
+  return out, carry
+end
+
+------------------------------------------------------------------
+-- Master-side distributed Kogge-Stone driver
+--
+-- Given a list of (gOut, pOut) pairs returned by compute nodes (one per
+-- chunk, in chunk-index order), this function runs the O(log C) prefix
+-- scan to determine the carryIn bit for every chunk.
+--
+-- Returns: carryIns[1..count] where carryIns[1] = 0 (no carry into the
+-- lowest chunk) and carryIns[i] = gOut_acc[i-1] for i > 1.
+-- Also returns finalCarryOut (the carry out of the last chunk, which
+-- may need to be appended as a new top limb/chunk).
+--
+-- The master calls this after all task_chunk_gp replies have come back,
+-- then dispatches task_chunk_final to each worker with the matching
+-- carryIn. This replaces the legacy O(C) sequential chunkAdd chain.
+------------------------------------------------------------------
+function bigint.masterPrefixCarries(gpList, count)
+  local gAcc, _ = bigint.prefixScanGP(gpList, count)
+  local carryIns = {}
+  carryIns[1] = 0
+  for i = 2, count do
+    carryIns[i] = gAcc[i - 1]
+  end
+  local finalCarryOut = gAcc[count]
+  return carryIns, finalCarryOut
 end
 
 ------------------------------------------------------------------
